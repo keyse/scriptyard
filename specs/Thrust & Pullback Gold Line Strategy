@@ -1,0 +1,157 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © LuxAlgo 
+
+//@version=6
+strategy("Thrust & Pullback Gold Line Strategy", overlay = true, margin_long = 100, margin_short = 100)
+
+// --- Groups ---
+string G1 = "PAC Structure Settings"
+string G2 = "Gold Line & Gap Settings"
+string G3 = "Trade Logic & Filters"
+string G4 = "Session & Time Filters"
+string G5 = "Debug Visuals"
+
+// --- Inputs ---
+lengthPAC      = input.int(5, "PAC Structure Length", minval = 1, group = G1, tooltip = "Lookback for Swing High/Low detection (Internal Structure)")
+htfInput       = input.timeframe("5", "HTF (Gold/Red Line)", group = G2)
+emaGoldLen     = input.int(9, "Gold Line EMA", minval = 1, group = G2)
+emaRedLen      = input.int(20, "Red Line EMA", minval = 1, group = G2)
+gapMinBars     = input.int(8, "Minimum Gap Bars", minval = 1, group = G2, tooltip = "Required bars above Gold Line before a valid touch")
+slopeLookback  = input.int(5, "Slope Lookback (Bars)", minval = 1, group = G2, tooltip = "Lookback to check if Gold Line is pointing Up")
+
+outlierMult    = input.float(2.0, "Outlier Multiplier (ATR)", minval = 1.0, step = 0.1, group = G3)
+setupTimeout   = input.int(3, "Entry Expiry (Bars)", minval = 1, group = G3)
+maxTouches     = input.int(2, "Max Touches Allowed", minval = 1, group = G3)
+minRoomRatio   = input.float(1.5, "Min Risk/Reward Ratio", minval = 0.1, step = 0.1, group = G3)
+
+sessionStr     = input.session("0945-1600", "Trade Session (EST)", group = G4, tooltip = "Entries only allowed during this window. Avoids the 09:30-09:45 chaos.")
+timezone       = input.string("America/New_York", "Timezone", group = G4)
+
+showDebugLabels = input.bool(true, "Show Setup Debug Labels", group = G5)
+showLines       = input.bool(true, "Show Gold/Red Lines", group = G5)
+
+// --- 1. Session High Tracker ---
+var float sessionHigh = na
+isNewSession = not na(ta.change(time("D", sessionStr, timezone)))
+if isNewSession
+    sessionHigh := high
+else
+    sessionHigh := math.max(sessionHigh, high)
+
+// --- 2. PAC Internal Structure Logic ---
+var float swingHigh = na
+var float swingLow  = na
+var int bearishCloses = 0
+
+pH = ta.pivothigh(high, lengthPAC, lengthPAC)
+pL = ta.pivotlow(low, lengthPAC, lengthPAC)
+
+if not na(pH)
+    swingHigh := pH
+if not na(pL)
+    swingLow := pL
+
+// Improved BOS Logic: Require two consecutive closes below the PAC Swing Low
+isBelowSwingLow = close < swingLow
+if isBelowSwingLow
+    bearishCloses += 1
+else
+    bearishCloses := 0
+
+var bool isBearishBOS = false
+if bearishCloses >= 2 and not isBearishBOS
+    isBearishBOS := true
+    if showDebugLabels
+        label.new(bar_index, high, "BEARISH BOS\n(2 Closes Below)", color=color.red, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// Reset Kill Switch on Bullish BOS (Close above Swing High)
+if close > swingHigh and isBearishBOS
+    isBearishBOS := false
+    if showDebugLabels
+        label.new(bar_index, low, "BULLISH BOS\n(Trend Restored)", color=color.green, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+// --- 3. HTF Gold & Red Line Calculations ---
+[htfGold, htfRed, htfGoldPrev] = request.security(syminfo.tickerid, htfInput, [ta.ema(close, emaGoldLen), ta.ema(close, emaRedLen), ta.ema(close, emaGoldLen)[slopeLookback]], lookahead = barmerge.lookahead_off)
+
+barsAbove = ta.barssince(low <= htfGold)
+hasValidGap = barsAbove >= gapMinBars
+isSlopeUp = htfGold > htfGoldPrev
+isAboveRedLine = close > htfRed
+isInSession = not na(time(timeframe.period, sessionStr, timezone))
+
+// --- 4. Touch & Setup Logic ---
+var int touchCount = 0
+if low <= htfGold and not (barsAbove[1] > 0)
+    touchCount := 0 // Reset when price loses the "Space"
+
+atr = ta.atr(14)
+isOutlier = (high - low) > (atr * outlierMult)
+touchOccurred = hasValidGap[1] and low <= htfGold and not isOutlier and not isBearishBOS and isSlopeUp and isAboveRedLine and isInSession
+
+if touchOccurred
+    touchCount += 1
+
+// Setup Variables
+var float setupHigh     = na
+var int   setupBarIdx   = 0
+var bool  setupActive   = false
+var float dynamicFloor  = na
+
+if touchOccurred and touchCount <= maxTouches
+    setupHigh    := high
+    setupBarIdx  := bar_index
+    setupActive  := true
+    dynamicFloor := low
+    if showDebugLabels
+        label.new(bar_index, low, "T#" + str.tostring(touchCount) + "\nValid Setup", color=color.yellow, style=label.style_label_up, textcolor=color.black, size=size.small)
+
+// Update Dynamic Floor during pullback phase
+if setupActive
+    dynamicFloor := math.min(dynamicFloor, low)
+
+// 5. Invalidation & Entry
+barsSinceTouch = bar_index - setupBarIdx
+
+if setupActive
+    // Invalidated if timeout, close below dynamic floor, or trend flip
+    if barsSinceTouch > setupTimeout or close < dynamicFloor or isBearishBOS or not isAboveRedLine
+        setupActive := false
+
+// Room to Run Math (Refined Target)
+entryPrice  = setupHigh + syminfo.mintick
+risk        = math.max(entryPrice - dynamicFloor, syminfo.mintick)
+target      = math.max(swingHigh, sessionHigh) // Target is PAC High or Session High
+reward      = target - entryPrice
+roomToRun   = (reward / risk) >= minRoomRatio
+setupTriggered = setupActive and not setupActive[1]
+
+// Debug RR Failure
+if setupTriggered and not roomToRun
+    if showDebugLabels
+        label.new(bar_index, high, "SKIP: Low RR\nRatio: " + str.tostring(reward/risk, "#.##"), color=color.gray, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+
+// Strategy Execution
+if setupActive and not (strategy.position_size > 0) and roomToRun
+    strategy.entry("Long", strategy.long, stop = entryPrice, comment = "T#" + str.tostring(touchCount))
+
+// 6. Trailing Stop & Exit
+if strategy.position_size > 0
+    setupActive := false
+    float trailingStop = low[1] - syminfo.mintick
+    strategy.exit("Exit", "Long", stop = trailingStop, limit = target, comment_loss = "Trail", comment_profit = "Target")
+
+// --- Visuals & Debugging ---
+plot(showLines ? htfGold : na, "5m Gold Line", color = #FFD700, linewidth = 2)
+plot(showLines ? htfRed : na, "5m Red Line (Filter)", color = #f23645, linewidth = 2)
+plot(swingHigh, "PAC High", color = color.new(color.red, 50), style = plot.style_linebr, offset = -lengthPAC)
+plot(swingLow, "PAC Low", color = color.new(color.blue, 50), style = plot.style_linebr, offset = -lengthPAC)
+plot(sessionHigh, "Session High", color = color.new(color.orange, 70), style = plot.style_circles)
+
+// Setup Debugging
+plot(setupActive ? setupHigh : na, "Trigger Level", color = color.green, style = plot.style_circles, linewidth = 1)
+plot(setupActive ? dynamicFloor : na, "Dynamic Floor", color = color.red, style = plot.style_linebr, linewidth = 1)
+
+bgcolor(isBearishBOS ? color.new(color.red, 90) : hasValidGap ? color.new(color.green, 95) : na)
+
+// Visual labels for entry check
+plotshape(strategy.position_size == 0 and setupActive and roomToRun, "Setup Pending", shape.arrowup, location.belowbar, color.green, size=size.tiny)

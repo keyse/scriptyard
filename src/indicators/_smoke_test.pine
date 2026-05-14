@@ -1,0 +1,17 @@
+//@version=6
+indicator("Pine workspace smoke test", overlay = true)
+// Sanity check: prove version=6, plot scope, format.mintick, var, and alert all work.
+i_len = input.int(20, "EMA length", minval = 1)
+emaVal = ta.ema(close, i_len)
+var int barsSeen = 0
+barsSeen += 1
+plot(emaVal, "EMA", color.orange, linewidth = 2)
+var table info = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 70))
+if barstate.islast
+    table.cell(info, 0, 0, "version", text_color = color.white)
+    table.cell(info, 1, 0, "6",       text_color = color.lime)
+    table.cell(info, 0, 1, "bars",    text_color = color.white)
+    table.cell(info, 1, 1, str.tostring(barsSeen), text_color = color.white)
+    table.cell(info, 0, 2, "last",    text_color = color.white)
+    table.cell(info, 1, 2, str.tostring(close, format.mintick), text_color = color.white)
+alertcondition(ta.crossover(close, emaVal), "Smoke: cross up", "smoke ok")

@@ -1,0 +1,18 @@
+# Claude Code local-only files
+CLAUDE.local.md
+.claude/settings.local.json
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+# Notes — keep notes/ tracked but ignore screenshots and journal scratch
+notes/screenshots/
+notes/*.tmp.md
+# Anything that smells like credentials — defensive, never commit
+.env
+.env.*
+secrets.*
+broker*.json
+broker*.yaml
+*credentials*

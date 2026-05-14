@@ -1,0 +1,59 @@
+//@version=6
+strategy("ORB skeleton",
+     overlay                      = true,
+     initial_capital              = 25000,
+     default_qty_type             = strategy.fixed,
+     default_qty_value            = 1,
+     commission_type              = strategy.commission.cash_per_contract,
+     commission_value             = 2.50,
+     slippage                     = 1,
+     margin_long                  = 50,
+     margin_short                 = 50,
+     pyramiding                   = 0,
+     calc_on_every_tick           = false,
+     process_orders_on_close      = false,
+     fill_orders_on_standard_ohlc = true,
+     max_lines_count              = 500,
+     max_labels_count             = 500,
+     max_boxes_count              = 500)
+// === Inputs ===
+i_orMin    = input.int(15, "OR length (minutes)", minval = 1, maxval = 60)
+i_session  = input.session("0930-1600", "RTH session")
+i_flatHour = input.int(15, "EOD flat hour (ET)",  minval = 0, maxval = 23)
+i_flatMin  = input.int(55, "EOD flat minute",     minval = 0, maxval = 59)
+i_tz       = "America/New_York"
+// === Session state ===
+inSession = not na(time(timeframe.period, i_session, i_tz))
+newDay    = ta.change(time("D", i_session, i_tz)) != 0
+var float orHi    = na
+var float orLo    = na
+var int   orStart = na
+var bool  orDone  = false
+if newDay
+    orHi    := na
+    orLo    := na
+    orStart := time
+    orDone  := false
+orWindowMs = i_orMin * 60 * 1000
+inOrWindow = inSession and (time - orStart) < orWindowMs
+if inOrWindow
+    orHi := na(orHi) ? high : math.max(orHi, high)
+    orLo := na(orLo) ? low  : math.min(orLo, low)
+else if inSession and not orDone
+    orDone := true
+// === Signals ===
+longBreak  = orDone and inSession and close > orHi and strategy.position_size == 0
+shortBreak = orDone and inSession and close < orLo and strategy.position_size == 0
+// === Entries ===
+if longBreak
+    strategy.entry("L", strategy.long)
+if shortBreak
+    strategy.entry("S", strategy.short)
+// === EOD flatten ===
+isFlatTime = hour(time, i_tz) == i_flatHour and minute(time, i_tz) >= i_flatMin
+if isFlatTime and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+// === Plots ===
+plot(orDone or inOrWindow ? orHi : na, "OR High", color.green, style = plot.style_linebr)
+plot(orDone or inOrWindow ? orLo : na, "OR Low",  color.red,   style = plot.style_linebr)
+bgcolor(inOrWindow ? color.new(color.blue, 90) : na, title = "OR window")

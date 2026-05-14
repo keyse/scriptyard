@@ -1,0 +1,19 @@
+Phase 3 round-trip aborted at step 1.
+
+Timestamp (UTC):  2026-04-30T174250Z
+Tool:             mcp__Claude_in_Chrome__navigate
+Target URL:       https://www.tradingview.com/chart/
+Error:            "This site is not allowed due to safety restrictions."
+
+Follow-up:        screenshot of chrome://newtab/ also blocked
+                  ("Cannot access a chrome:// URL").
+
+Cause:            tradingview.com is on the Claude-in-Chrome extension's
+                  navigation deny-list at the policy/extension level.
+                  Not a transient connectivity issue.
+
+State on disk:    Phase 1 + Phase 2 complete and verified.
+                  src/indicators/_smoke_test.pine compiles by inspection
+                  (valid Pine v6 after artifact-strip pass).
+
+Workspace path:   /Users/mohamoudibrahim/Sammy/auto-trading

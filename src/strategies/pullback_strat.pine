@@ -1,0 +1,416 @@
+//@version=6
+// 9/20 EMA Pullback Strategy v4 — see specs/pullback_strat.spec.md
+// Signal logic is duplicated from src/indicators/pullback_indicator.pine v2 per
+// the "Inline-during-dev" pattern in docs/ARCHITECTURE.md. When RiskLib /
+// SignalLib are published, both files become candidates for import-based reuse.
+//
+// v3 deltas: realized-fill R:R gate (Pass-through no longer bypasses i_minRr),
+// trend-quality gate (EMA separation + ATR percentile), late-entry cutoff,
+// max-bars-in-trade time stop. See spec § Version history.
+// v4 deltas: min pivot-reward floor (kills scratch "target" wins), stop distance
+// cap (clamps long-tailed touch bars). See spec § Version history.
+strategy("9/20 EMA Pullback Strategy",
+     overlay                      = true,
+     initial_capital              = 25000,
+     default_qty_type             = strategy.fixed,
+     default_qty_value            = 1,
+     commission_type              = strategy.commission.cash_per_contract,
+     commission_value             = 0.62,
+     slippage                     = 1,
+     margin_long                  = 50,
+     margin_short                 = 50,
+     pyramiding                   = 0,
+     calc_on_every_tick           = false,
+     calc_on_order_fills          = false,
+     process_orders_on_close      = false,
+     fill_orders_on_standard_ohlc = true,
+     max_lines_count              = 500,
+     max_labels_count             = 500,
+     max_boxes_count              = 500)
+
+// ─── INPUTS ────────────────────────────────────────────────────────────────
+i_emaFastLen        = input.int(9,    "Fast EMA Length",        minval = 1,  group = "EMAs")
+i_emaSlowLen        = input.int(20,   "Slow EMA Length",        minval = 1,  group = "EMAs")
+i_emaTf             = input.timeframe("5", "EMA Timeframe",                  group = "EMAs")
+
+i_maxBarsToConfirm  = input.int(5,    "Max bars after touch",   minval = 1,  group = "Setup")
+
+i_pivotLeft         = input.int(8,    "Pivot Left",             minval = 1,  group = "R/R")
+i_pivotRight        = input.int(8,    "Pivot Right",            minval = 1,  group = "R/R")
+i_minRr             = input.float(3.0,"Minimum R:R",            minval = 0.1, step = 0.1, group = "R/R")
+// Toggling i_requireRr off voids the strategy's structural edge: pivots barely
+// above close become valid targets, producing scratch-level wins that cannot
+// compensate for full-stop losses. Off is a debug-only mode. See spec v4.
+i_requireRr         = input.bool(true,"Require minimum R:R",                 group = "R/R")
+i_breakoutMode      = input.string("Block", "Breakout R/R handling",
+                                    options = ["Pass-through", "ATR target", "Block"], group = "R/R")
+i_atrLen            = input.int(14,   "ATR length",             minval = 1,  group = "R/R")
+i_atrTargetMult     = input.float(3.0,"ATR target multiple",    minval = 0.1, step = 0.1, group = "R/R")
+i_pivotMaxAge       = input.int(20,   "Max pivot age (bars)",   minval = 1,  group = "R/R")
+// v4 min pivot-reward floor: pivot is only a valid target if it sits at least
+// i_minPivotRewardAtr * ATR above (long) / below (short) entry close. Filters
+// "+$0.50 target" trades observed in the 2026-05-02 MES backtest.
+i_minPivotRewardAtr = input.float(0.75,"Min pivot reward (× ATR)", minval = 0, step = 0.05, group = "R/R")
+
+// Risk shaping (v2): ATR cushion on stops, cooldown after losses, BE move.
+// v3 adds max-bars-in-trade time stop.
+i_stopAtrMult       = input.float(0.5, "Stop ATR cushion (× ATR)", minval = 0,   step = 0.1, group = "Risk")
+// v4 stop distance cap: clamps stop toward entry close when the touch bar has a
+// long lower wick (long) / upper wick (short). Limits the ~10pt loss outliers
+// observed in the 2026-05-02 MES backtest. Set to 0 to disable.
+i_maxStopAtr        = input.float(1.5, "Max stop distance (× ATR, 0 = off)", minval = 0, step = 0.1, group = "Risk")
+i_stopCooldownBars  = input.int(5,     "Bars cooldown after stop", minval = 0,                group = "Risk")
+i_useBreakeven      = input.bool(true, "Move stop to BE at trigger R",                        group = "Risk")
+i_beAtR             = input.float(1.0, "BE trigger (R)",           minval = 0.1, step = 0.1, group = "Risk")
+i_maxBarsInTrade    = input.int(30,    "Max bars in trade (0 = off)", minval = 0,             group = "Risk")
+
+// HTF regime gate (v2): block longs in HTF downtrend, shorts in HTF uptrend.
+i_useHtfRegime      = input.bool(true,        "Use HTF regime filter",          group = "Regime")
+i_htfRegimeTf       = input.timeframe("D",    "Regime TF",                      group = "Regime")
+i_htfRegimeLen      = input.int(20,           "Regime SMA length", minval = 1,  group = "Regime")
+
+// Trend-quality gate (v3): require EMA separation AND ATR percentile floor.
+// 100-bar percentile lookback is intentionally fixed to limit knob proliferation.
+i_useTrendQuality   = input.bool(true,  "Use trend-quality gate",                                  group = "Trend Quality")
+i_minEmaSepAtr      = input.float(0.2,  "Min |emaFast − emaSlow| / ATR", minval = 0, step = 0.05,  group = "Trend Quality")
+i_minAtrPct         = input.int(30,     "Min ATR percentile (100-bar lookback)", minval = 0, maxval = 100, group = "Trend Quality")
+
+i_flatHour          = input.int(15,   "EOD flatten hour (ET)",  minval = 0, maxval = 23, group = "Session")
+i_flatMinute        = input.int(30,   "EOD flatten minute (ET)",minval = 0, maxval = 59, group = "Session")
+i_warmupMinutes     = input.int(15,   "Skip first N min after 09:30 ET", minval = 0, group = "Session")
+i_lastEntryHour     = input.int(14,   "Last-entry hour (ET)",   minval = 0, maxval = 23, group = "Session")
+i_lastEntryMinute   = input.int(30,   "Last-entry minute (ET)", minval = 0, maxval = 59, group = "Session")
+
+i_showDashboard     = input.bool(true, "Show dashboard",                     group = "Dashboard")
+i_dashbg            = input.color(color.new(color.black, 70), "Dashboard background", group = "Dashboard")
+
+// ─── MTF EMAs (HTF values, evaluated on chart TF) ──────────────────────────
+// Canonical non-repaint idiom: [1] offset on the expression + lookahead_on.
+// Tupled into one request.security call to conserve the 40-call budget.
+[emaFast, emaSlow] = request.security(syminfo.tickerid, i_emaTf,
+     [ta.ema(close, i_emaFastLen)[1], ta.ema(close, i_emaSlowLen)[1]],
+     lookahead = barmerge.lookahead_on)
+
+plot(emaFast, "9 EMA (HTF)",  color = color.new(#FFC107, 0), linewidth = 2)
+plot(emaSlow, "20 EMA (HTF)", color = color.new(#E53935, 0), linewidth = 2)
+
+// HTF regime — daily close vs daily SMA. Same non-repaint idiom; tuple keeps
+// us under the 40-call request.security cap.
+[htfRegClose, htfRegSma] = request.security(syminfo.tickerid, i_htfRegimeTf,
+     [close[1], ta.sma(close, i_htfRegimeLen)[1]],
+     lookahead = barmerge.lookahead_on)
+htfBull    = htfRegClose > htfRegSma
+htfBear    = htfRegClose < htfRegSma
+allowLong  = not i_useHtfRegime or htfBull
+allowShort = not i_useHtfRegime or htfBear
+
+// ─── REGIME ────────────────────────────────────────────────────────────────
+bullRegime = emaFast > emaSlow
+bearRegime = emaFast < emaSlow
+
+// ─── TOUCH DETECTION ───────────────────────────────────────────────────────
+bullTouch = bullRegime and low <= emaFast and high >= emaFast
+bearTouch = bearRegime and low <= emaFast and high >= emaFast
+
+// ─── PIVOTS for R/R targets ────────────────────────────────────────────────
+ph = ta.pivothigh(high, i_pivotLeft, i_pivotRight)
+pl = ta.pivotlow (low,  i_pivotLeft, i_pivotRight)
+
+var float lastPivotHigh    = na
+var int   lastPivotHighBar = na
+var float lastPivotLow     = na
+var int   lastPivotLowBar  = na
+
+if not na(ph)
+    lastPivotHigh    := ph
+    lastPivotHighBar := bar_index - i_pivotRight
+if not na(pl)
+    lastPivotLow     := pl
+    lastPivotLowBar  := bar_index - i_pivotRight
+
+phFresh = not na(lastPivotHigh) and (bar_index - lastPivotHighBar) <= i_pivotMaxAge
+plFresh = not na(lastPivotLow)  and (bar_index - lastPivotLowBar)  <= i_pivotMaxAge
+
+atrVal = ta.atr(i_atrLen)
+
+// ─── TREND-QUALITY GATE (v3) ───────────────────────────────────────────────
+// Filters "EMAs glued / dead market" regimes that produce most false signals.
+// ta.percentrank runs unconditionally per the INVARIANTS scope rule. First
+// 100 bars on a fresh chart return na — guarded explicitly below.
+emaSep         = math.abs(emaFast - emaSlow)
+atrPctRank     = ta.percentrank(atrVal, 100)
+trendQualityOk = not i_useTrendQuality
+                 or (emaSep >= i_minEmaSepAtr * atrVal
+                     and not na(atrPctRank)
+                     and atrPctRank >= i_minAtrPct)
+
+// ─── SIGNAL STATE (duplicated from pullback_indicator.pine v2) ─────────────
+var bool  bullArmed     = false
+var float bullTouchHigh = na
+var float bullTouchLow  = na
+var int   bullBarsSince = 0
+
+var bool  bearArmed     = false
+var float bearTouchHigh = na
+var float bearTouchLow  = na
+var int   bearBarsSince = 0
+
+if not bullRegime
+    bullArmed := false
+if not bearRegime
+    bearArmed := false
+
+if bullArmed
+    bullBarsSince += 1
+    if bullBarsSince > i_maxBarsToConfirm
+        bullArmed := false
+if bearArmed
+    bearBarsSince += 1
+    if bearBarsSince > i_maxBarsToConfirm
+        bearArmed := false
+
+bullConfirmRaw = bullArmed and bullBarsSince >= 1 and close > bullTouchHigh
+bearConfirmRaw = bearArmed and bearBarsSince >= 1 and close < bearTouchLow
+
+// Cushioned stop levels: touch extreme +/- a fraction of ATR. Used both for
+// the R:R sizing here AND for the live exit stop, so quoted R = realized R.
+// v4: clamp the touch extreme toward `close` so a long-tailed touch bar can't
+// produce a 10-point stop. With i_maxStopAtr = 0 the clamp is disabled.
+bullStopAnchor = i_maxStopAtr > 0 ? math.max(bullTouchLow,  close - i_maxStopAtr * atrVal) : bullTouchLow
+bearStopAnchor = i_maxStopAtr > 0 ? math.min(bearTouchHigh, close + i_maxStopAtr * atrVal) : bearTouchHigh
+bullStopLevel = bullStopAnchor  - i_stopAtrMult * atrVal
+bearStopLevel = bearStopAnchor  + i_stopAtrMult * atrVal
+bullRisk = bullConfirmRaw ? close - bullStopLevel : na
+bearRisk = bearConfirmRaw ? bearStopLevel - close : na
+
+// v4: pivot is only "valid as a target" if it's at least i_minPivotRewardAtr *
+// ATR away from close. The math.max(..., syminfo.mintick) floor is what
+// preserves v3's strict-inequality semantic when i_minPivotRewardAtr = 0:
+// because mintick > 0, the floor still requires pivot to be at least one tick
+// above (long) / below (short) close, equivalent to v3's `>` check on
+// tick-aligned prices.
+bullMinReward  = i_minPivotRewardAtr * atrVal
+bearMinReward  = i_minPivotRewardAtr * atrVal
+bullPivotValid = phFresh and (lastPivotHigh - close) >= math.max(bullMinReward, syminfo.mintick)
+bearPivotValid = plFresh and (close - lastPivotLow)  >= math.max(bearMinReward, syminfo.mintick)
+
+// v3: target = the SAME number the strategy will submit to strategy.exit,
+// computed once and reused for the R:R gate AND the live limit. In Block
+// mode without a valid pivot, target stays na — which structurally blocks
+// the signal via the `not na(bullTarget)` guard below. No separate
+// "breakout pass-through" flag, no defensive runtime check needed.
+isAtrFallbackOk = i_breakoutMode != "Block"
+
+float bullTarget = na
+if bullConfirmRaw
+    if bullPivotValid
+        bullTarget := lastPivotHigh
+    else if isAtrFallbackOk
+        bullTarget := close + i_atrTargetMult * atrVal
+
+float bearTarget = na
+if bearConfirmRaw
+    if bearPivotValid
+        bearTarget := lastPivotLow
+    else if isAtrFallbackOk
+        bearTarget := close - i_atrTargetMult * atrVal
+
+bullReward = not na(bullTarget) ? bullTarget - close : na
+bearReward = not na(bearTarget) ? close - bearTarget : na
+
+bullRr = not na(bullRisk) and bullRisk > 0 and not na(bullReward) and bullReward > 0 ? bullReward / bullRisk : na
+bearRr = not na(bearRisk) and bearRisk > 0 and not na(bearReward) and bearReward > 0 ? bearReward / bearRisk : na
+
+bullSignal = bullConfirmRaw and not na(bullTarget)
+             and (not i_requireRr or (not na(bullRr) and bullRr >= i_minRr))
+bearSignal = bearConfirmRaw and not na(bearTarget)
+             and (not i_requireRr or (not na(bearRr) and bearRr >= i_minRr))
+
+// One-shot trigger semantics: clear armed state on raw confirmation.
+if bullConfirmRaw
+    bullArmed := false
+if bearConfirmRaw
+    bearArmed := false
+
+// New touch (no re-arm rule).
+if bullTouch and not bullArmed
+    bullArmed     := true
+    bullTouchHigh := high
+    bullTouchLow  := low
+    bullBarsSince := 0
+if bearTouch and not bearArmed
+    bearArmed     := true
+    bearTouchHigh := high
+    bearTouchLow  := low
+    bearBarsSince := 0
+
+// ─── COOLDOWN AFTER STOP ───────────────────────────────────────────────────
+// Track the most recent bar a real stop fired on, so we suppress immediate
+// re-entry into chop. BE-stops use exit comment "be" and don't trigger.
+// `ta.change` runs unconditionally per the INVARIANTS scope rule.
+var int lastStopBar = na
+closedDelta = ta.change(strategy.closedtrades)
+if closedDelta > 0
+    lastIdx = strategy.closedtrades - 1
+    if strategy.closedtrades.exit_comment(lastIdx) == "stop"
+        lastStopBar := bar_index
+inCooldown = not na(lastStopBar) and (bar_index - lastStopBar) < i_stopCooldownBars
+
+// ─── SESSION GATING ────────────────────────────────────────────────────────
+i_tz = "America/New_York"
+curHour   = hour(time, i_tz)
+curMinute = minute(time, i_tz)
+isFlatTime = curHour == i_flatHour and curMinute >= i_flatMinute
+isPastFlat = curHour >  i_flatHour or (curHour == i_flatHour and curMinute >= i_flatMinute)
+// Skip the first N minutes after the 09:30 ET RTH open (avoid open-print chop).
+inWarmup   = curHour < 9 or (curHour == 9 and curMinute < 30 + i_warmupMinutes)
+// v3 late-entry cutoff: block new entries inside the last hour before EOD.
+// User convention is i_lastEntryHour:i_lastEntryMinute < i_flatHour:i_flatMinute;
+// not enforced here.
+isPastLastEntry = curHour >  i_lastEntryHour
+                  or (curHour == i_lastEntryHour and curMinute >= i_lastEntryMinute)
+canEnter   = not isPastFlat and not inWarmup and not isPastLastEntry
+
+// ─── STRATEGY STATE — frozen at signal time ────────────────────────────────
+// TODO: replace fixed sizing with RiskLib.sizeByRisk once the library exists
+// (see docs/PATTERNS.md "Library export skeleton").
+// v3 note: bullTarget / bearTarget computed in the R:R block above are the
+// SAME values used as strategy.exit limits — the v2 longTargetCandidate /
+// shortTargetCandidate intermediates are gone (DRY).
+var float entryStop   = na
+var float entryTarget = na
+
+// ─── ORDERS ────────────────────────────────────────────────────────────────
+takeLong  = bullSignal and strategy.position_size == 0 and canEnter and not inCooldown and allowLong  and trendQualityOk
+takeShort = bearSignal and strategy.position_size == 0 and canEnter and not inCooldown and allowShort and trendQualityOk
+
+// curStop tracks the live exit stop — may be moved to BE mid-trade.
+// beMoved guards a one-shot move per trade.
+var float curStop = na
+var bool  beMoved = false
+
+if takeLong
+    entryStop   := bullStopLevel
+    entryTarget := bullTarget
+    curStop     := entryStop
+    beMoved     := false
+    strategy.entry("L", strategy.long)
+    strategy.exit("X-L", from_entry = "L", stop = curStop, limit = entryTarget,
+                  comment_loss = "stop", comment_profit = "target")
+
+if takeShort
+    entryStop   := bearStopLevel
+    entryTarget := bearTarget
+    curStop     := entryStop
+    beMoved     := false
+    strategy.entry("S", strategy.short)
+    strategy.exit("X-S", from_entry = "S", stop = curStop, limit = entryTarget,
+                  comment_loss = "stop", comment_profit = "target")
+
+// Breakeven move at +i_beAtR R favorable. Re-issuing strategy.exit with the
+// same id replaces the live stop. Comment flipped to "be" so the cooldown
+// tracker doesn't count a BE-out as a real stop.
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+if i_useBreakeven and not beMoved and (inLong or inShort) and not na(entryStop)
+    entryPx  = strategy.position_avg_price
+    initRisk = inLong ? (entryPx - entryStop) : (entryStop - entryPx)
+    if initRisk > 0
+        if inLong  and (high - entryPx) >= i_beAtR * initRisk
+            curStop := entryPx
+            beMoved := true
+            strategy.exit("X-L", from_entry = "L", stop = curStop, limit = entryTarget,
+                          comment_loss = "be", comment_profit = "target")
+        if inShort and (entryPx - low)  >= i_beAtR * initRisk
+            curStop := entryPx
+            beMoved := true
+            strategy.exit("X-S", from_entry = "S", stop = curStop, limit = entryTarget,
+                          comment_loss = "be", comment_profit = "target")
+
+// v3 max-bars-in-trade time stop. Use opentrades.entry_bar_index so we don't
+// have to manually track entryBar across exits. Comment "time" so the cooldown
+// gate (which only counts "stop" exits) ignores it. Suppressed during the EOD
+// flatten window so EOD's "EOD" comment wins on overlap.
+hasOpenTrade = strategy.opentrades >= 1
+barsInTrade  = hasOpenTrade ? bar_index - strategy.opentrades.entry_bar_index(0) : 0
+if i_maxBarsInTrade > 0 and hasOpenTrade and barsInTrade >= i_maxBarsInTrade and not isFlatTime
+    strategy.close_all(comment = "time")
+
+// EOD flatten.
+if isFlatTime and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+
+// Note: entryStop/entryTarget are NOT cleared when flat. They are only
+// overwritten on the next entry. The dashboard guards display on
+// strategy.position_size != 0, so stale values are never shown. Clearing
+// them on the signal bar would race the queued entry (position_size is
+// still 0 on the signal bar; the order fills at next-bar open).
+
+// ─── RENDER ────────────────────────────────────────────────────────────────
+plotshape(takeLong,  "Long Entry",  shape.triangleup,   location.belowbar,
+          color = color.new(color.lime, 0), size = size.small, text = "L")
+plotshape(takeShort, "Short Entry", shape.triangledown, location.abovebar,
+          color = color.new(color.red,  0), size = size.small, text = "S")
+
+// ─── DASHBOARD ─────────────────────────────────────────────────────────────
+var table dash = table.new(position.bottom_right, 2, 10, bgcolor = i_dashbg, border_width = 1)
+
+posLabel = strategy.position_size == 0    ? "FLAT"
+         : strategy.position_size > 0     ? str.format("LONG {0}",  math.abs(strategy.position_size))
+                                          : str.format("SHORT {0}", math.abs(strategy.position_size))
+
+entryStr  = strategy.position_size != 0 ? str.tostring(strategy.position_avg_price, format.mintick) : "—"
+stopTgtStr = strategy.position_size != 0 and not na(entryStop) and not na(entryTarget)
+             ? str.tostring(entryStop, format.mintick) + " / " + str.tostring(entryTarget, format.mintick)
+             : "—"
+
+// Open R guards: position open AND (entry - stop) != 0.
+float openR = na
+if strategy.position_size > 0 and not na(entryStop) and (strategy.position_avg_price - entryStop) != 0
+    openR := (close - strategy.position_avg_price) / (strategy.position_avg_price - entryStop)
+else if strategy.position_size < 0 and not na(entryStop) and (entryStop - strategy.position_avg_price) != 0
+    openR := (strategy.position_avg_price - close) / (entryStop - strategy.position_avg_price)
+openRStr = na(openR) ? "—" : str.format("{0,number,#.##} R", openR)
+
+closed   = strategy.closedtrades
+wins     = strategy.wintrades
+losses   = strategy.losstrades
+winRateStr = closed > 0 ? str.format("{0,number,#.#} %", wins / closed * 100) : "—"
+
+gp = strategy.grossprofit
+gl = math.abs(strategy.grossloss)
+pfStr = gl > 0          ? str.format("{0,number,#.##}", gp / gl)
+      : gp > 0 and gl == 0 ? "∞"
+                           : "—"
+
+mddStr  = str.tostring(strategy.max_drawdown, format.mintick)
+netStr  = str.tostring(strategy.netprofit,    format.mintick)
+
+if i_showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Position",      text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, posLabel,        text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Entry",         text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, entryStr,        text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 2, "Stop / Target", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, stopTgtStr,      text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 3, "Open R",        text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, openRStr,        text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 4, "Trades",        text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(closed), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 5, "W / L",         text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 5, str.format("W:{0}  L:{1}", wins, losses), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 6, "Win rate",      text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 6, winRateStr,      text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 7, "Profit factor", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 7, pfStr,           text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 8, "Max DD",        text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 8, mddStr,          text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 9, "Net P&L",       text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 9, netStr,          text_color = color.white, text_size = size.small)
+
+// ─── ALERTS ────────────────────────────────────────────────────────────────
+// alertcondition() — global scope, const string. TODO v2-strat: refactor to
+// alert() with JSON webhook bodies per docs/PATTERNS.md "Webhook JSON alert"
+// when broker bridge goes live.
+alertcondition(takeLong,  "Pullback Long Entry",  "9/20 EMA Pullback STRAT: Long entry")
+alertcondition(takeShort, "Pullback Short Entry", "9/20 EMA Pullback STRAT: Short entry")

@@ -1,0 +1,214 @@
+//@version=6
+indicator("9/20 EMA Pullback Entry — 5m EMAs on 1m",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500)
+
+// ─── INPUTS ────────────────────────────────────────────────────────────────
+i_emaFastLen        = input.int(9,    "Fast EMA Length",        minval = 1,  group = "EMAs")
+i_emaSlowLen        = input.int(20,   "Slow EMA Length",        minval = 1,  group = "EMAs")
+i_emaTf             = input.timeframe("5", "EMA Timeframe",                  group = "EMAs")
+
+i_maxBarsToConfirm  = input.int(5,    "Max bars after touch",   minval = 1,  group = "Setup")
+
+i_pivotLeft         = input.int(5,    "Pivot Left",             minval = 1,  group = "R/R")
+i_pivotRight        = input.int(5,    "Pivot Right",            minval = 1,  group = "R/R")
+i_minRr             = input.float(2.0,"Minimum R:R",            minval = 0.1, step = 0.1, group = "R/R")
+i_requireRr         = input.bool(true,"Require minimum R:R",                 group = "R/R")
+i_breakoutMode      = input.string("Pass-through", "Breakout R/R handling",
+                                    options = ["Pass-through", "ATR target", "Block"], group = "R/R")
+i_atrLen            = input.int(14,   "ATR length",             minval = 1,  group = "R/R")
+i_atrTargetMult     = input.float(2.0,"ATR target multiple",    minval = 0.1, step = 0.1, group = "R/R")
+i_pivotMaxAge       = input.int(50,   "Max pivot age (bars)",   minval = 1,  group = "R/R")
+
+i_showDebug         = input.bool(false,"Show debug overlay",                 group = "Debug")
+
+// ─── MTF EMAs (HTF values, evaluated on chart TF) ──────────────────────────
+// Canonical non-repaint idiom: [1] offset on the expression + lookahead_on.
+// Tupled into one request.security call (was 2 in v1) to conserve the 40-call budget.
+[emaFast, emaSlow] = request.security(syminfo.tickerid, i_emaTf,
+     [ta.ema(close, i_emaFastLen)[1], ta.ema(close, i_emaSlowLen)[1]],
+     lookahead = barmerge.lookahead_on)
+
+plot(emaFast, "9 EMA (HTF)",  color = color.new(#FFC107, 0), linewidth = 2)
+plot(emaSlow, "20 EMA (HTF)", color = color.new(#E53935, 0), linewidth = 2)
+
+// ─── REGIME ────────────────────────────────────────────────────────────────
+bullRegime = emaFast > emaSlow
+bearRegime = emaFast < emaSlow
+
+// ─── TOUCH DETECTION (fast EMA value lies anywhere in candle range) ────────
+bullTouch = bullRegime and low <= emaFast and high >= emaFast
+bearTouch = bearRegime and low <= emaFast and high >= emaFast
+
+// ─── PIVOTS for R/R targets ────────────────────────────────────────────────
+ph = ta.pivothigh(high, i_pivotLeft, i_pivotRight)
+pl = ta.pivotlow (low,  i_pivotLeft, i_pivotRight)
+
+var float lastPivotHigh    = na
+var int   lastPivotHighBar = na
+var float lastPivotLow     = na
+var int   lastPivotLowBar  = na
+
+if not na(ph)
+    lastPivotHigh    := ph
+    lastPivotHighBar := bar_index - i_pivotRight
+if not na(pl)
+    lastPivotLow     := pl
+    lastPivotLowBar  := bar_index - i_pivotRight
+
+phFresh = not na(lastPivotHigh) and (bar_index - lastPivotHighBar) <= i_pivotMaxAge
+plFresh = not na(lastPivotLow)  and (bar_index - lastPivotLowBar)  <= i_pivotMaxAge
+
+atrVal = ta.atr(i_atrLen)
+
+// ─── STATE ─────────────────────────────────────────────────────────────────
+var bool  bullArmed     = false
+var float bullTouchHigh = na
+var float bullTouchLow  = na
+var int   bullBarsSince = 0
+
+var bool  bearArmed     = false
+var float bearTouchHigh = na
+var float bearTouchLow  = na
+var int   bearBarsSince = 0
+
+// 1. Regime invalidation
+if not bullRegime
+    bullArmed := false
+if not bearRegime
+    bearArmed := false
+
+// 2. Window expiry
+if bullArmed
+    bullBarsSince += 1
+    if bullBarsSince > i_maxBarsToConfirm
+        bullArmed := false
+if bearArmed
+    bearBarsSince += 1
+    if bearBarsSince > i_maxBarsToConfirm
+        bearArmed := false
+
+// 3. Raw confirmation (must be at least one bar after the touch)
+bullConfirmRaw = bullArmed and bullBarsSince >= 1 and close > bullTouchHigh
+bearConfirmRaw = bearArmed and bearBarsSince >= 1 and close < bearTouchLow
+
+// 4. R/R computation at the entry bar
+//    Risk legs
+bullRisk = bullConfirmRaw ? close - bullTouchLow  : na
+bearRisk = bearConfirmRaw ? bearTouchHigh - close : na
+
+//    Reward leg with breakout handling — Bull
+bullPivotValid    = phFresh and lastPivotHigh > close
+bullPivotBreakout = phFresh and lastPivotHigh <= close
+
+float bullReward       = na
+bool  bullBreakoutPass = false
+if bullConfirmRaw
+    if bullPivotValid
+        bullReward := lastPivotHigh - close
+    else if bullPivotBreakout
+        if i_breakoutMode == "Pass-through"
+            bullBreakoutPass := true
+        else if i_breakoutMode == "ATR target"
+            bullReward := i_atrTargetMult * atrVal
+        // "Block" → reward stays na, signal filtered
+    else
+        // No fresh pivot at all — ATR fallback if enabled
+        if i_breakoutMode == "ATR target"
+            bullReward := i_atrTargetMult * atrVal
+
+//    Reward leg with breakout handling — Bear (mirror)
+bearPivotValid    = plFresh and lastPivotLow < close
+bearPivotBreakout = plFresh and lastPivotLow >= close
+
+float bearReward       = na
+bool  bearBreakoutPass = false
+if bearConfirmRaw
+    if bearPivotValid
+        bearReward := close - lastPivotLow
+    else if bearPivotBreakout
+        if i_breakoutMode == "Pass-through"
+            bearBreakoutPass := true
+        else if i_breakoutMode == "ATR target"
+            bearReward := i_atrTargetMult * atrVal
+    else
+        if i_breakoutMode == "ATR target"
+            bearReward := i_atrTargetMult * atrVal
+
+//    Final R/R values
+bullRr = not na(bullRisk) and bullRisk > 0 and not na(bullReward) ? bullReward / bullRisk : na
+bearRr = not na(bearRisk) and bearRisk > 0 and not na(bearReward) ? bearReward / bearRisk : na
+
+//    Signal gating
+bullSignal = bullConfirmRaw and (not i_requireRr
+                                 or bullBreakoutPass
+                                 or (not na(bullRr) and bullRr >= i_minRr))
+bearSignal = bearConfirmRaw and (not i_requireRr
+                                 or bearBreakoutPass
+                                 or (not na(bearRr) and bearRr >= i_minRr))
+
+// 5. Clear armed state on raw confirmation (regardless of R/R — trigger fires once)
+if bullConfirmRaw
+    bullArmed := false
+if bearConfirmRaw
+    bearArmed := false
+
+// 6. New touch (no re-arm rule: only arm if not already armed)
+if bullTouch and not bullArmed
+    bullArmed     := true
+    bullTouchHigh := high
+    bullTouchLow  := low
+    bullBarsSince := 0
+if bearTouch and not bearArmed
+    bearArmed     := true
+    bearTouchHigh := high
+    bearTouchLow  := low
+    bearBarsSince := 0
+
+// ─── DEBUG ─────────────────────────────────────────────────────────────────
+plot(i_showDebug and bullArmed ? bullTouchHigh : na, "Bull threshold",
+     color = color.new(color.lime, 30), style = plot.style_linebr, linewidth = 1)
+plot(i_showDebug and bullArmed ? bullTouchLow  : na, "Bull stop",
+     color = color.new(color.red, 30),  style = plot.style_linebr, linewidth = 1)
+
+plot(i_showDebug and bearArmed ? bearTouchLow  : na, "Bear threshold",
+     color = color.new(color.red, 30),  style = plot.style_linebr, linewidth = 1)
+plot(i_showDebug and bearArmed ? bearTouchHigh : na, "Bear stop",
+     color = color.new(color.lime, 30), style = plot.style_linebr, linewidth = 1)
+
+bgcolor(i_showDebug and bullArmed ? color.new(color.lime, 92) : na, title = "Bull armed bg")
+bgcolor(i_showDebug and bearArmed ? color.new(color.red,  92) : na, title = "Bear armed bg")
+
+if bullConfirmRaw and i_showDebug
+    label.new(bar_index, high, str.format("conf rr={0,number,#.##}", nz(bullRr, -1)),
+              style = label.style_label_down, color = color.new(color.blue, 60),
+              textcolor = color.white, size = size.tiny)
+if bearConfirmRaw and i_showDebug
+    label.new(bar_index, low, str.format("conf rr={0,number,#.##}", nz(bearRr, -1)),
+              style = label.style_label_up, color = color.new(color.blue, 60),
+              textcolor = color.white, size = size.tiny)
+
+// ─── RENDER ────────────────────────────────────────────────────────────────
+plotshape(bullTouch, "Bull Touch",  shape.circle,       location.belowbar, color = color.new(#FFC107, 50), size = size.tiny)
+plotshape(bearTouch, "Bear Touch",  shape.circle,       location.abovebar, color = color.new(#FFC107, 50), size = size.tiny)
+
+plotshape(bullSignal, "Bull Entry", shape.triangleup,   location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "L")
+plotshape(bearSignal, "Bear Entry", shape.triangledown, location.abovebar, color = color.new(color.red,  0), size = size.small, text = "S")
+
+if bullSignal
+    string bullLbl = bullBreakoutPass ? "BRK ↑" : str.format("R/R {0,number,#.##}", nz(bullRr, 0))
+    label.new(bar_index, low, bullLbl, style = label.style_label_up,
+              color = color.new(color.lime, 70), textcolor = color.white, size = size.small)
+
+if bearSignal
+    string bearLbl = bearBreakoutPass ? "BRK ↓" : str.format("R/R {0,number,#.##}", nz(bearRr, 0))
+    label.new(bar_index, high, bearLbl, style = label.style_label_down,
+              color = color.new(color.red, 70), textcolor = color.white, size = size.small)
+
+// ─── ALERTS ────────────────────────────────────────────────────────────────
+// alertcondition() — global scope, const string. v3 will refactor to alert()
+// inside if-blocks with JSON webhook bodies once the broker bridge is wired up.
+alertcondition(bullSignal, "Bullish Entry", "9/20 EMA Pullback: Bullish entry")
+alertcondition(bearSignal, "Bearish Entry", "9/20 EMA Pullback: Bearish entry")
