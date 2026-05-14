@@ -1,0 +1,141 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © auto-trading / ORBCoreLib
+//@version=6
+library("ORBCoreLib", overlay = false)
+
+// =============================================================================
+// ORBCoreLib — shared, instrument-agnostic ORB utilities
+// Import after publishing: import user/ORBCoreLib/1 as orb
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// f_classify_pattern
+// ---------------------------------------------------------------------------
+//@function  Classify the 4-candle opening-range sequence by its close trajectory.
+//@param     c1   Close of OR candle 1 (e.g. 09:30 bar).
+//@param     c2   Close of OR candle 2 (e.g. 09:35 bar).
+//@param     c3   Close of OR candle 3 (e.g. 09:40 bar).
+//@param     c4   Close of OR candle 4 (e.g. 09:45 bar).
+//@returns   One of: "STRONG_UP", "STRONG_DOWN", "V_SHAPE", "INV_V", "WEAK_UP", "WEAK_DOWN", "UNKNOWN".
+export f_classify_pattern(series float c1, series float c2, series float c3, series float c4) =>
+    string result = "UNKNOWN"
+    if not na(c1) and not na(c2) and not na(c3) and not na(c4)
+        result :=
+            c1 < c2 and c2 < c3 and c3 < c4 ? "STRONG_UP" :
+            c1 > c2 and c2 > c3 and c3 > c4 ? "STRONG_DOWN" :
+            c2 < c1 and c4 > c2             ? "V_SHAPE" :
+            c2 > c1 and c4 < c2             ? "INV_V" :
+            c4 > c1                          ? "WEAK_UP" :
+            c4 < c1                          ? "WEAK_DOWN" :
+                                               "UNKNOWN"
+    result
+
+// ---------------------------------------------------------------------------
+// f_classify_regime
+// ---------------------------------------------------------------------------
+//@function  Classify the OR range into a volatility regime bucket.
+//@param     or_range    High - Low of the opening range in price points.
+//@param     narrow_max  Upper boundary (inclusive) for NARROW regime.
+//@param     medium_max  Upper boundary (inclusive) for MEDIUM regime; above → WIDE.
+//@returns   One of: "NARROW", "MEDIUM", "WIDE".
+export f_classify_regime(series float or_range, simple float narrow_max, simple float medium_max) =>
+    string result =
+        or_range <= narrow_max ? "NARROW" :
+        or_range <= medium_max ? "MEDIUM" :
+                                 "WIDE"
+    result
+
+// ---------------------------------------------------------------------------
+// f_conviction_score
+// ---------------------------------------------------------------------------
+//@function  Score the quality of an OR break (0–5). Each enabled component
+//           adds 1 point; disabled components are treated as passing (add 1).
+//@param     break_dir      Direction of break: 1 = long, -1 = short.
+//@param     bull_body      True if the last OR candle closed bullish.
+//@param     close_pos      Close position relative to OR: (close-or_low)/(or_high-or_low).
+//@param     body_pct       Body size as fraction of total OR range.
+//@param     pattern        Pattern string from f_classify_pattern.
+//@param     regime         Regime string from f_classify_regime.
+//@param     en_body        Enable the body-direction component.
+//@param     en_close       Enable the close-position component.
+//@param     close_thr      Threshold for close-position score (0–1, e.g. 0.70).
+//@param     en_pattern     Enable the pattern-alignment component.
+//@param     en_width       Enable the regime-width (non-WIDE) component.
+//@param     en_bodysize    Enable the body-size component.
+//@param     bodysize_thr   Minimum body fraction to score the bodysize component.
+//@returns   Integer conviction score in range 0–5.
+export f_conviction_score(
+     series int    break_dir,
+     series bool   bull_body,
+     series float  close_pos,
+     series float  body_pct,
+     series string pattern,
+     series string regime,
+     simple bool   en_body,
+     simple bool   en_close,
+     simple float  close_thr,
+     simple bool   en_pattern,
+     simple bool   en_width,
+     simple bool   en_bodysize,
+     simple float  bodysize_thr) =>
+    int s = 0
+    // 1. Body direction aligns with break
+    bool body_ok = en_body ? (break_dir == 1 ? bull_body : not bull_body) : true
+    s += body_ok ? 1 : 0
+    // 2. Close position in upper/lower portion of OR
+    bool close_ok = en_close ? (break_dir == 1 ? close_pos >= close_thr : close_pos <= (1.0 - close_thr)) : true
+    s += close_ok ? 1 : 0
+    // 3. Pattern alignment
+    bool pat_ok = en_pattern ?
+         (break_dir == 1 ? (pattern == "STRONG_UP" or pattern == "V_SHAPE" or pattern == "WEAK_UP") :
+                           (pattern == "STRONG_DOWN" or pattern == "INV_V" or pattern == "WEAK_DOWN")) :
+         true
+    s += pat_ok ? 1 : 0
+    // 4. Regime is not WIDE (avoids choppy wide ranges)
+    bool width_ok = en_width ? (regime != "WIDE") : true
+    s += width_ok ? 1 : 0
+    // 5. Sufficient body size
+    bool bsize_ok = en_bodysize ? (body_pct >= bodysize_thr) : true
+    s += bsize_ok ? 1 : 0
+    s
+
+// ---------------------------------------------------------------------------
+// f_build_entry_json
+// ---------------------------------------------------------------------------
+//@function  Build a TradersPost-compatible JSON alert string for an entry.
+//@param     ticker    Instrument symbol string (e.g. "MNQ").
+//@param     action    "buy" or "sell".
+//@param     px        Entry price (numeric, no quotes in JSON).
+//@param     stop_px   Stop-loss price (numeric).
+//@param     tp_px     Take-profit price (numeric).
+//@param     sig       Signal identifier string (e.g. "E0_LONG").
+//@returns   Single-line JSON string.
+export f_build_entry_json(
+     series string ticker,
+     series string action,
+     series float  px,
+     series float  stop_px,
+     series float  tp_px,
+     series string sig) =>
+    '{"ticker":"' + ticker +
+    '","action":"' + action +
+    '","price":'   + str.tostring(px,      "#.##") +
+    ',"stopPrice":' + str.tostring(stop_px, "#.##") +
+    ',"takeProfit":' + str.tostring(tp_px,  "#.##") +
+    ',"signalId":"' + sig + '"}'
+
+// ---------------------------------------------------------------------------
+// f_build_exit_json
+// ---------------------------------------------------------------------------
+//@function  Build a TradersPost-compatible JSON alert string for an exit.
+//@param     ticker   Instrument symbol string.
+//@param     px       Exit price (numeric).
+//@param     sig      Signal identifier string.
+//@returns   Single-line JSON string.
+export f_build_exit_json(
+     series string ticker,
+     series float  px,
+     series string sig) =>
+    '{"ticker":"' + ticker +
+    '","action":"exit","price":' + str.tostring(px, "#.##") +
+    ',"signalId":"' + sig + '"}'
