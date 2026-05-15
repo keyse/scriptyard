@@ -345,13 +345,12 @@ if is_post_or and not na(or_high) and not na(or_low) and not or_classified
               or_range <= i_medium_max ? REG_M : REG_W
     if not na(c1) and not na(c4)
         bool have_all = not na(c2) and not na(c3)
-        pattern :=
-            have_all and c1 < c2 and c2 < c3 and c3 < c4 ? SUP :
-            have_all and c1 > c2 and c2 > c3 and c3 > c4 ? SDN :
-            not na(c2) and c2 < c1 and c4 > c2            ? VV  :
-            not na(c2) and c2 > c1 and c4 < c2            ? IV  :
-            c4 > c1                                        ? WU  :
-            c4 < c1                                        ? WD  : UNK
+        pattern := have_all and c1 < c2 and c2 < c3 and c3 < c4 ? SUP :
+                   have_all and c1 > c2 and c2 > c3 and c3 > c4 ? SDN :
+                   not na(c2) and c2 < c1 and c4 > c2            ? VV  :
+                   not na(c2) and c2 > c1 and c4 < c2            ? IV  :
+                   c4 > c1                                        ? WU  :
+                   c4 < c1                                        ? WD  : UNK
     else
         pattern := UNK
 
