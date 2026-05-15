@@ -832,7 +832,7 @@ if i_show_composite and or_classified and not or_classified[1] and not na(or_hig
             WD  => "W↓"
             => "?"
         string bias_word = break_dir == 1 ? "BULL" : break_dir == -1 ? "BEAR" : "NONE"
-        string lbl_text  = pat_short + " | " + nz(regime, "?") + " | " + bias_word +
+        string lbl_text  = pat_short + " | " + (na(regime) ? "?" : regime) + " | " + bias_word +
              "\n" + str.tostring(math.round(nz(or_range, 0.0), 2)) + "pts" +
              "  U=" + str.tostring(math.round(u_wick, 0)) + "%" +
              "  L=" + str.tostring(math.round(l_wick, 0)) + "%"
@@ -851,21 +851,20 @@ var table info_tbl = table.new(position.top_right, 2, 12,
      border_color = color.new(color.gray, 60),
      border_width = 1)
 
-if barstate.islastconfirmedhistory
-    // Row helpers
-    f_row(int row, string lbl, string val, color vc) =>
-        table.cell(info_tbl, 0, row, lbl,
-             text_color = color.new(color.silver, 0), text_size = size.small)
-        table.cell(info_tbl, 1, row, val,
-             text_color = vc, text_size = size.small)
+f_row(int row, string lbl, string val, color vc) =>
+    table.cell(info_tbl, 0, row, lbl,
+         text_color = color.new(color.silver, 0), text_size = size.small)
+    table.cell(info_tbl, 1, row, val,
+         text_color = vc, text_size = size.small)
 
+if barstate.islastconfirmedhistory
     color ok_col   = color.new(color.lime,   0)
     color warn_col = color.new(color.orange, 0)
     color bad_col  = color.new(color.red,    0)
     color neu_col  = color.new(color.white,  0)
 
-    f_row(0,  "Regime",     nz(regime,  "—"), regime == REG_N ? warn_col : regime == REG_W ? warn_col : ok_col)
-    f_row(1,  "Pattern",    nz(pattern, "—"), neu_col)
+    f_row(0,  "Regime",     na(regime)  ? "—" : regime,  regime == REG_N ? warn_col : regime == REG_W ? warn_col : ok_col)
+    f_row(1,  "Pattern",    na(pattern) ? "—" : pattern, neu_col)
     f_row(2,  "Score",      str.tostring(score) + "/5",
          score >= i_min_score ? ok_col : bad_col)
     f_row(3,  "OR Range",   str.tostring(math.round(nz(or_range, 0.0), 2)) + "pts", neu_col)
