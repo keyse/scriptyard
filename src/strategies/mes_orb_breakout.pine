@@ -558,17 +558,10 @@ f_base_tp(string etype) =>
     tp
 
 f_entry_json(string action, string sig, float stop_px, float tp_px) =>
-    '{"ticker":"' + i_tp_symbol +
-    '","action":"' + action +
-    '","price":'   + str.tostring(close, "#.##") +
-    ',"stopPrice":' + str.tostring(stop_px, "#.##") +
-    ',"takeProfit":' + str.tostring(tp_px, "#.##") +
-    ',"signalId":"' + sig + '"}'
+    '{"ticker":"' + i_tp_symbol + '","action":"' + action + '","price":' + str.tostring(close, "#.##") + ',"stopPrice":' + str.tostring(stop_px, "#.##") + ',"takeProfit":' + str.tostring(tp_px, "#.##") + ',"signalId":"' + sig + '"}'
 
 f_exit_json(string sig) =>
-    '{"ticker":"' + i_tp_symbol +
-    '","action":"exit","price":' + str.tostring(close, "#.##") +
-    ',"signalId":"' + sig + '"}'
+    '{"ticker":"' + i_tp_symbol + '","action":"exit","price":' + str.tostring(close, "#.##") + ',"signalId":"' + sig + '"}'
 
 manage_trade(string id, float stop_val, float tp_val, string etype) =>
     float s = stop_val
