@@ -1,0 +1,1022 @@
+// =============================================================================
+// MNQ ORB Breakout Playbook v6 — TradersPost Integration Rebuild
+// =============================================================================
+//
+// STRATEGY OVERVIEW
+//   Opening Range Breakout strategy for MNQ futures.
+//   Opening Range window: 9:30-9:50 ET (4 × 5-min bars).
+//   Up to 3 entries per session: E0 (initial break), E1 (1st retouch), E2 (2nd retouch).
+//   Pattern + regime + conviction score filters before entry.
+//   Directional lockout: first break locks direction for the day.
+//
+// ALERT ARCHITECTURE (Model A: Pine drives, TradersPost executes)
+//   Pine owns ALL exit logic. TradersPost only receives 3 signal shapes:
+//
+//   --------------------------------------------------------------------------
+//   SHAPE 1 — ENTRY (long or short)
+//   { "ticker": "MNQ", "action": "buy",  "quantity": 1, "signalId": "E0_ENTRY" }
+//   { "ticker": "MNQ", "action": "sell", "quantity": 1, "signalId": "E0_ENTRY" }
+//   No stopPrice or takeProfit. Pine fires explicit exits when SL/TP hit.
+//   --------------------------------------------------------------------------
+//   SHAPE 2 — PER-ENTRY EXIT (closes one specific entry's quantity)
+//   { "ticker": "MNQ", "action": "exit", "quantity": 1, "signalId": "E0_STOP" }
+//   { "ticker": "MNQ", "action": "exit", "quantity": 1, "signalId": "E1_TP" }
+//   { "ticker": "MNQ", "action": "exit", "quantity": 1, "signalId": "E0_TP1" }
+//   --------------------------------------------------------------------------
+//   SHAPE 3 — FORCED FLATTEN (closes EVERYTHING regardless of quantity)
+//   { "ticker": "MNQ", "action": "exit", "sentiment": "flat", "signalId": "SESSION_END" }
+//   sentiment:flat overrides quantity. Used for session end, time stop,
+//   opposite level, deep cross-back.
+//   --------------------------------------------------------------------------
+//
+// TRADERSPOST PRE-LAUNCH CHECKLIST
+//   [ ] "Use signal quantity" ENABLED on strategy subscription
+//       (Without this the quantity field is ignored — per-entry exits silently fail)
+//   [ ] "Side swapping" DISABLED (prevents accidental reversals)
+//   [ ] "Allow add to position" ENABLED (required for E1/E2 to stack on E0)
+//   [ ] Ticker = "MNQ" (not "MNQ1!" — TradersPost requires plain futures symbol)
+//   [ ] Webhook URL pasted in TradingView alert's Notifications tab
+//
+// TRADINGVIEW ALERT SETUP
+//   Condition:     this strategy → "alert() function calls only"
+//   Interval:      5m
+//   Expiration:    Open-ended
+//   Notifications: Webhook URL = your TradersPost endpoint
+//   Message:       any text (ignored when using "alert() function calls only")
+//
+//   IMPORTANT: TradingView caches the script snapshot when an alert is created.
+//   Any change to inputs requires DELETING and RECREATING the alert.
+//
+// =============================================================================
+
+//@version=6
+strategy(
+    title             = "MNQ ORB Breakout Playbook v6",
+    shorttitle        = "MNQ ORB v6",
+    overlay           = true,
+
+    // pyramiding = max SEPARATE entries open at once (E0+E1+E2 = 3).
+    // Each entry counts as 1 regardless of contract quantity. NOT contract size.
+    pyramiding        = 3,
+
+    default_qty_type  = strategy.fixed,
+    default_qty_value = 1,
+    initial_capital   = 10000,
+    commission_type   = strategy.commission.cash_per_contract,
+    commission_value  = 0.62,
+    slippage          = 1,
+
+    // Bar-close evaluation (no look-ahead) + fill at signal bar close.
+    // High backtest-to-live fidelity for OR break strategies.
+    calc_on_every_tick      = false,
+    process_orders_on_close = true,
+
+    max_boxes_count   = 500,
+    max_lines_count   = 500,
+    max_labels_count  = 500
+)
+
+// =============================================================================
+// SECTION 1 — INPUTS
+// =============================================================================
+
+// --- OR Window ---
+or_start_hour    = input.int(9,  "OR start hour (ET)",            group = "OR Window")
+or_start_min     = input.int(30, "OR start minute",               group = "OR Window")
+or_end_hour      = input.int(9,  "OR end hour (ET)",              group = "OR Window")
+or_end_min       = input.int(50, "OR end minute",                 group = "OR Window")
+session_end_hour = input.int(15, "Session end hour (force flat)", group = "OR Window")
+session_end_min  = input.int(55, "Session end minute",            group = "OR Window")
+tz_input         = input.string("America/New_York", "Timezone",   group = "OR Window")
+
+// --- OR Regime Width ---
+narrow_max = input.float(120, "NARROW upper bound (pts)", group = "OR Regime Width")
+medium_max = input.float(200, "MEDIUM upper bound (pts)", group = "OR Regime Width")
+
+// --- OR Shape Filter ---
+enable_shape_filter = input.bool(true,  "Enable shape filter",                group = "OR Shape Filter")
+allow_v_shape       = input.bool(true,  "Allow V-Shape (down-up)",            group = "OR Shape Filter")
+allow_inv_v         = input.bool(true,  "Allow INV-V (up-down)",              group = "OR Shape Filter")
+allow_weak_up       = input.bool(true,  "Allow Weak Up",                      group = "OR Shape Filter")
+allow_weak_down     = input.bool(false, "Allow Weak Down (75% fade — risky)", group = "OR Shape Filter")
+allow_strong_up     = input.bool(false, "Allow Strong Up (max 0.86× ever)",   group = "OR Shape Filter")
+allow_strong_down   = input.bool(true,  "Allow Strong Down",                  group = "OR Shape Filter")
+
+// --- Conviction Score (0-5) ---
+enable_score_filter = input.bool(true,  "Enable conviction score filter",         group = "Conviction Score")
+min_score           = input.int(3,      "Minimum score (0-5)",                    group = "Conviction Score")
+score_body_aligned  = input.bool(true,  "Score: body aligned with break",         group = "Conviction Score")
+score_close_pos     = input.bool(true,  "Score: 9:45 close in top/bottom zone",   group = "Conviction Score")
+score_pat_aligned   = input.bool(true,  "Score: pattern matches break direction", group = "Conviction Score")
+score_width_ok      = input.bool(true,  "Score: width is NARROW or MEDIUM",       group = "Conviction Score")
+score_body_size     = input.bool(true,  "Score: body size >= minimum",            group = "Conviction Score")
+body_size_min       = input.float(0.30, "Body size min (fraction of OR)",         group = "Conviction Score")
+close_pos_threshold = input.float(0.30, "Close position zone fraction",           group = "Conviction Score")
+
+// --- Position Sizing ---
+//   Per-entry base × global integer multiplier.
+//   Default 1/1/1 mult=1 → all entries 1 contract.
+//   Aggressive: 1/1/1 mult=3 → all entries 3 contracts.
+//   Anchor: 2/1/1 mult=1 → E0 doubles, retouches normal.
+e0_base   = input.int(1, "E0 base quantity",                 minval=0, group = "Position Sizing")
+e1_base   = input.int(1, "E1 base quantity",                 minval=0, group = "Position Sizing")
+e2_base   = input.int(1, "E2 base quantity",                 minval=0, group = "Position Sizing")
+size_mult = input.int(1, "Global size multiplier (integer)", minval=1, group = "Position Sizing")
+
+// --- Entries ---
+enable_e0           = input.bool(true,  "E0: Enter on initial break",       group = "Entries")
+enable_e1           = input.bool(true,  "E1: Enter on first retouch",       group = "Entries")
+enable_e2           = input.bool(true,  "E2: Enter on second retouch",      group = "Entries")
+retouch_touch_zone  = input.float(10,   "Retouch zone (pts from OR level)", group = "Entries")
+max_entries_per_day = input.int(3,      "Max separate entries per session", group = "Entries", minval=1, maxval=3)
+break_confirm_pts   = input.float(5,    "Break confirmation pts beyond OR", group = "Entries")
+
+// --- Targets by Pattern (× OR width) ---
+tp_v_shape_tp1     = input.float(1.10, "V-Shape TP1",               group = "Targets by Pattern")
+tp_v_shape_tp2     = input.float(2.00, "V-Shape TP2 (clean break)", group = "Targets by Pattern")
+tp_inv_v_tp1       = input.float(0.75, "INV-V TP1",                 group = "Targets by Pattern")
+tp_weak_up_tp1     = input.float(0.50, "Weak Up TP1",               group = "Targets by Pattern")
+tp_strong_up_tp1   = input.float(0.43, "Strong Up cap",             group = "Targets by Pattern")
+tp_strong_down_tp1 = input.float(1.20, "Strong Down TP1",           group = "Targets by Pattern")
+tp_wide_cap        = input.float(0.50, "WIDE OR absolute cap",      group = "Targets by Pattern")
+
+// --- Retouch Decay & Cap ---
+enable_retouch_decay    = input.bool(true,  "Enable E2 target decay",              group = "Retouch Decay")
+e2_target_factor        = input.float(0.80, "E2 target = pattern TP × this",       group = "Retouch Decay")
+enable_retouch_modifier = input.bool(true,  "Enable retouch count cap",            group = "Retouch Decay")
+retouch_reduce_at       = input.int(5,      "Cap target when N retouches reached", group = "Retouch Decay")
+retouch_cap_after_n     = input.float(0.50, "Target cap after N retouches (×OR)",  group = "Retouch Decay")
+
+// --- Initial Stop Levels ---
+narrow_stop_type = input.string("BOTH",     "NARROW stop type",  options=["OR_LOW","TIME_BASED","BOTH"], group = "Initial Stops")
+medium_e0_stop   = input.string("OR_LOW",   "MEDIUM E0 stop",    options=["OR_LOW","MIDPOINT"],          group = "Initial Stops")
+medium_e1e2_stop = input.string("MIDPOINT", "MEDIUM E1/E2 stop", options=["OR_LOW","MIDPOINT"],          group = "Initial Stops")
+wide_stop_type   = input.string("MIDPOINT", "WIDE stop",         options=["OR_LOW","MIDPOINT"],          group = "Initial Stops")
+
+// --- Stop Ratchet ---
+m_e0_adj1_trigger = input.float(0.50, "MEDIUM E0: OR_LOW → MID after +×OR",      group = "Stop Ratchet")
+m_e0_adj2_trigger = input.float(0.75, "MEDIUM E0: MID → break level after +×OR", group = "Stop Ratchet")
+m_e1_adj2_trigger = input.float(0.75, "MEDIUM E1/E2: → break level after +×OR",  group = "Stop Ratchet")
+narrow_be_trigger = input.float(1.00, "NARROW: → break level after +×OR",        group = "Stop Ratchet")
+wide_be_trigger   = input.float(0.40, "WIDE: → break level after +×OR (earlier)",group = "Stop Ratchet")
+
+// --- NARROW Time Stop ---
+narrow_time_stop_mins    = input.int(20,    "NARROW: time stop window (mins from break)", group = "NARROW Time Stop")
+narrow_time_stop_e0_only = input.bool(true, "NARROW time stop: E0 only",                  group = "NARROW Time Stop")
+
+// --- Opposite Level Exit ---
+enable_opposite_exit = input.bool(true, "Exit when opposite OR level tested",  group = "Opposite Level Exit")
+opposite_exit_zone   = input.float(10,  "Opposite exit zone (pts from level)", group = "Opposite Level Exit")
+
+// --- Deep Cross-Back Exit ---
+enable_deep_crossback_exit = input.bool(true,  "Enable deep cross-back exit",            group = "Deep Cross-Back")
+crossback_depth_exit       = input.float(0.30, "Depth threshold (×OR)",                  group = "Deep Cross-Back")
+crossback_dur_exit         = input.int(8,      "Duration threshold (bars)",              group = "Deep Cross-Back")
+enable_shallow_hold        = input.bool(true,  "Hold through shallow quick cross-backs", group = "Deep Cross-Back")
+shallow_depth_max          = input.float(0.20, "Shallow max depth (×OR)",                group = "Deep Cross-Back")
+shallow_duration_max       = input.int(2,      "Shallow max duration (bars)",            group = "Deep Cross-Back")
+deep_exit_fae_guard        = input.float(0.50, "Deep Exit FAE guard (×OR, 0=disabled)",  group = "Deep Cross-Back")
+deep_exit_e0               = input.bool(true,  "Deep Exit fires on E0",                  group = "Deep Cross-Back")
+deep_exit_e1               = input.bool(true,  "Deep Exit fires on E1",                  group = "Deep Cross-Back")
+deep_exit_e2               = input.bool(false, "Deep Exit fires on E2",                  group = "Deep Cross-Back")
+
+// --- Clean Break TP Upgrade ---
+enable_clean_break      = input.bool(true,  "Enable clean break TP upgrade",                  group = "Clean Break Upgrade")
+clean_break_mins        = input.int(30,     "Bars of no retest to confirm (5min × 6 = 30min)",group = "Clean Break Upgrade")
+clean_break_retest_zone = input.float(10,   "Retest zone disqualifying clean break (pts)",    group = "Clean Break Upgrade")
+clean_break_target      = input.float(2.00, "Clean break target (×OR)",                       group = "Clean Break Upgrade")
+
+// --- Weak Up Partial Exit (Path D — graceful) ---
+//   Auto-dormant when entry quantity is 1 (can't split 1 contract).
+//   At qty >= 2: closes 50% at TP1, trails remainder from broken level.
+enable_weak_up_partial = input.bool(true, "Enable Weak Up partial (dormant at qty<2)", group = "Weak Up Partial")
+
+// --- Visual Aids ---
+show_entry_labels  = input.bool(true, "Show entry labels (E0/E1/E2)",    group = "Visual Aids")
+show_debug_labels  = input.bool(true, "Show 'NO TRADE' debug labels",    group = "Visual Aids")
+show_composite     = input.bool(true, "Show composite OR candle",        group = "Visual Aids")
+show_midpoint      = input.bool(true, "Show OR midpoint line",           group = "Visual Aids")
+show_pattern_label = input.bool(true, "Show pattern label on composite", group = "Visual Aids")
+comp_bull_color    = input.color(color.new(#26a69a, 30), "Composite bull", group = "Visual Aids")
+comp_bear_color    = input.color(color.new(#ef5350, 30), "Composite bear", group = "Visual Aids")
+comp_wick_width    = input.int(2, "Composite wick line width (px)",        group = "Visual Aids")
+
+// --- TradersPost Alerts ---
+enable_traderspost_alerts = input.bool(true,  "Enable TradersPost alerts",                    group = "TradersPost Alerts")
+traderspost_symbol        = input.string("MNQ", "TradersPost ticker (MNQ — not MNQ1!)",       group = "TradersPost Alerts")
+alert_test_mode           = input.bool(false, "TEST MODE — fires sample JSONs every bar",     group = "TradersPost Alerts")
+
+// =============================================================================
+// SECTION 2 — CONSTANTS & STATE
+// =============================================================================
+
+var string P_STRONG_UP   = "STRONG_UP"
+var string P_STRONG_DOWN = "STRONG_DOWN"
+var string P_V_SHAPE     = "V_SHAPE"
+var string P_INV_V       = "INV_V"
+var string P_WEAK_UP     = "WEAK_UP"
+var string P_WEAK_DOWN   = "WEAK_DOWN"
+
+var string R_NARROW = "NARROW"
+var string R_MEDIUM = "MEDIUM"
+var string R_WIDE   = "WIDE"
+
+is_new_day = ta.change(time("D", tz_input)) != 0
+
+// OR state
+var float or_high  = na
+var float or_low   = na
+var float or_mid   = na
+var float or_open  = na
+var float or_close = na
+var float or_range = na
+
+// 5-min closes inside OR window (pattern classification)
+var float c1_c = na  // 9:30 close
+var float c2_c = na  // 9:35 close
+var float c3_c = na  // 9:40 close
+var float c4_c = na  // 9:45 close
+
+// Classification state
+var string regime           = ""
+var string pattern          = ""
+var int    score            = 0
+var bool   or_classified    = false
+var bool   score_calculated = false
+
+// Break detection (directional lockout — once set, stays for the day)
+var int break_dir = 0   // 0 = no break, 1 = bull, -1 = bear
+var int break_idx = na
+
+// Retouch & entry counters
+var int retouch_cnt   = 0
+var int day_entry_cnt = 0
+var int last_r_b      = 0
+
+// Clean break tracking
+var bool clean_break_act  = false
+var int  bars_since_break = 0
+var bool cb_disqualified  = false
+
+// Max favorable excursion (drives ratchets)
+var float max_fav_exc = 0.0
+
+// Deep cross-back bar counter
+var int b_in_r = 0
+
+// Per-entry state — each entry's qty, stop, TP, partial flag
+var int   e0_active_qty    = 0
+var float e0_stop          = na
+var float e0_tp            = na
+var bool  e0_partial_taken = false
+
+var int   e1_active_qty    = 0
+var float e1_stop          = na
+var float e1_tp            = na
+var bool  e1_partial_taken = false
+
+var int   e2_active_qty    = 0
+var float e2_stop          = na
+var float e2_tp            = na
+var bool  e2_partial_taken = false
+
+// Bar-level guard — max one forced flatten alert per bar
+var bool exit_triggered_this_bar = false
+
+// Debug
+var int    or_complete_bar = na
+var string block_reason    = na
+
+// =============================================================================
+// SECTION 3 — TIME & SESSION RESET
+// =============================================================================
+
+t_hour = hour(time, tz_input)
+t_min  = minute(time, tz_input)
+t_val  = t_hour * 100 + t_min                     // HHMM as int
+
+or_s_v = or_start_hour    * 100 + or_start_min    // 930
+or_e_v = or_end_hour      * 100 + or_end_min      // 950
+tr_e_v = session_end_hour * 100 + session_end_min // 1555
+
+is_or_window      = t_val >= or_s_v and t_val < or_e_v
+is_or_complete    = t_val >= or_e_v and t_val[1] < or_e_v
+is_trading_window = t_val >= or_e_v and t_val < tr_e_v
+
+// Per-day reset
+if is_new_day
+    or_high          := na
+    or_low           := na
+    or_mid           := na
+    or_open          := na
+    or_close         := na
+    or_range         := na
+    c1_c             := na
+    c2_c             := na
+    c3_c             := na
+    c4_c             := na
+    regime           := ""
+    pattern          := ""
+    score            := 0
+    or_classified    := false
+    score_calculated := false
+    break_dir        := 0
+    break_idx        := na
+    retouch_cnt      := 0
+    day_entry_cnt    := 0
+    last_r_b         := 0
+    clean_break_act  := false
+    bars_since_break := 0
+    cb_disqualified  := false
+    max_fav_exc      := 0.0
+    b_in_r           := 0
+    or_complete_bar  := na
+    block_reason     := na
+
+    e0_active_qty    := 0
+    e0_stop          := na
+    e0_tp            := na
+    e0_partial_taken := false
+    e1_active_qty    := 0
+    e1_stop          := na
+    e1_tp            := na
+    e1_partial_taken := false
+    e2_active_qty    := 0
+    e2_stop          := na
+    e2_tp            := na
+    e2_partial_taken := false
+
+// Bar-level guard reset
+if barstate.isnew
+    exit_triggered_this_bar := false
+
+// =============================================================================
+// SECTION 4 — OR BUILDING (9:30-9:49 ET)
+// =============================================================================
+
+if is_or_window
+    if na(or_high)
+        or_high := high
+        or_low  := low
+        or_open := open
+    else
+        or_high := math.max(or_high, high)
+        or_low  := math.min(or_low,  low)
+
+    if t_hour == 9 and t_min == 30
+        c1_c := close
+    else if t_hour == 9 and t_min == 35
+        c2_c := close
+    else if t_hour == 9 and t_min == 40
+        c3_c := close
+    else if t_hour == 9 and t_min == 45
+        c4_c     := close
+        or_close := close
+
+// =============================================================================
+// SECTION 5 — OR CLASSIFICATION (regime + pattern)
+// =============================================================================
+
+if is_or_complete and not or_classified and not na(or_high)
+    or_range := or_high - or_low
+    or_mid   := (or_high + or_low) / 2
+
+    if or_range < narrow_max
+        regime := R_NARROW
+    else if or_range < medium_max
+        regime := R_MEDIUM
+    else
+        regime := R_WIDE
+
+    if not na(c1_c) and not na(c4_c)
+        if c1_c < c2_c and c2_c < c3_c and c3_c < c4_c
+            pattern := P_STRONG_UP
+        else if c1_c > c2_c and c2_c > c3_c and c3_c > c4_c
+            pattern := P_STRONG_DOWN
+        else if c2_c < c1_c and c4_c > c2_c
+            pattern := P_V_SHAPE
+        else if c2_c > c1_c and c4_c < c2_c
+            pattern := P_INV_V
+        else if c4_c > c1_c
+            pattern := P_WEAK_UP
+        else
+            pattern := P_WEAK_DOWN
+
+    or_classified   := true
+    or_complete_bar := bar_index
+
+// =============================================================================
+// SECTION 6 — BREAK DETECTION (with directional lockout)
+// =============================================================================
+//
+// Wick-based: bar high (or low for shorts) must exceed OR boundary by
+// break_confirm_pts. Bar close not required to be beyond.
+//
+// Directional lockout: `break_dir == 0` guard means once a direction is set,
+// no opposite-side break can register for the rest of the session.
+
+is_bull_break = break_dir == 0 and is_trading_window and not na(or_high) and high > or_high + break_confirm_pts and low >= or_low
+is_bear_break = break_dir == 0 and is_trading_window and not na(or_low)  and low  < or_low  - break_confirm_pts and high <= or_high
+
+if is_bull_break
+    break_dir := 1
+    break_idx := bar_index
+if is_bear_break
+    break_dir := -1
+    break_idx := bar_index
+
+// =============================================================================
+// SECTION 7 — CONVICTION SCORE (0-5)
+// =============================================================================
+
+if break_dir != 0 and not score_calculated and not na(or_range)
+    s         = 0
+    bull_body = not na(or_close) and not na(or_open) and or_close > or_open
+    close_pos = not na(or_close) ? (or_close - or_low) / or_range : 0.5
+    body_pct  = not na(or_close) ? math.abs(or_close - or_open) / or_range : 0.0
+
+    if score_body_aligned and ((break_dir ==  1 and bull_body) or (break_dir == -1 and not bull_body))
+        s += 1
+    if score_close_pos
+        if (break_dir ==  1 and close_pos >= (1.0 - close_pos_threshold)) or (break_dir == -1 and close_pos <= close_pos_threshold)
+            s += 1
+    if score_pat_aligned
+        if (break_dir ==  1 and (pattern == P_STRONG_UP   or pattern == P_WEAK_UP   or pattern == P_V_SHAPE)) or
+           (break_dir == -1 and (pattern == P_STRONG_DOWN or pattern == P_WEAK_DOWN or pattern == P_INV_V))
+            s += 1
+    if score_width_ok and regime != R_WIDE
+        s += 1
+    if score_body_size and body_pct >= body_size_min
+        s += 1
+
+    score            := s
+    score_calculated := true
+
+// =============================================================================
+// SECTION 8 — SHAPE & SCORE FILTERS
+// =============================================================================
+
+filter_ok = true
+
+if enable_shape_filter and pattern != ""
+    p_allowed = false
+    if pattern == P_V_SHAPE     and allow_v_shape
+        p_allowed := true
+    if pattern == P_INV_V       and allow_inv_v
+        p_allowed := true
+    if pattern == P_WEAK_UP     and allow_weak_up
+        p_allowed := true
+    if pattern == P_WEAK_DOWN   and allow_weak_down
+        p_allowed := true
+    if pattern == P_STRONG_UP   and allow_strong_up
+        p_allowed := true
+    if pattern == P_STRONG_DOWN and allow_strong_down
+        p_allowed := true
+    if not p_allowed
+        filter_ok := false
+
+if enable_score_filter and score < min_score
+    filter_ok := false
+
+// =============================================================================
+// SECTION 9 — CLEAN BREAK TRACKING + MAX FAVORABLE EXCURSION
+// =============================================================================
+//
+// Clean break: if price stays away from broken OR level for clean_break_mins
+// (default 30 min = 6 bars on 5-min chart), TP upgrades to clean_break_target × OR.
+//
+// MFE: tracks max favorable excursion since break. Drives stop ratchets.
+
+if break_dir != 0 and not clean_break_act and bar_index > break_idx
+    bars_since_break += 1
+    dist = break_dir == 1 ? low - or_high : or_low - high
+    if dist <= clean_break_retest_zone
+        cb_disqualified := true
+    if bars_since_break >= int(clean_break_mins / 5) and not cb_disqualified
+        clean_break_act := true
+
+if break_dir != 0
+    curr_exc    = break_dir == 1 ? high - or_high : or_low - low
+    max_fav_exc := math.max(max_fav_exc, curr_exc)
+
+// =============================================================================
+// SECTION 10 — STOP & TP HELPERS
+// =============================================================================
+
+get_initial_stop(string etype) =>
+    float sl = na
+    if (pattern == P_STRONG_UP and break_dir == 1) or (pattern == P_STRONG_DOWN and break_dir == -1)
+        sl := break_dir == 1 ? or_low : or_high
+    else if regime == R_NARROW
+        sl := break_dir == 1 ? or_low : or_high
+    else if regime == R_MEDIUM
+        if etype == "E0"
+            sl := medium_e0_stop == "OR_LOW" ? (break_dir == 1 ? or_low : or_high) : or_mid
+        else
+            sl := medium_e1e2_stop == "MIDPOINT" ? or_mid : (break_dir == 1 ? or_low : or_high)
+    else
+        sl := wide_stop_type == "MIDPOINT" ? or_mid : (break_dir == 1 ? or_low : or_high)
+    sl
+
+get_initial_tp(string etype) =>
+    mult = 0.75
+    if pattern == P_V_SHAPE
+        mult := tp_v_shape_tp1
+    if pattern == P_INV_V
+        mult := tp_inv_v_tp1
+    if pattern == P_WEAK_UP
+        mult := tp_weak_up_tp1
+    if pattern == P_STRONG_UP
+        mult := tp_strong_up_tp1
+    if pattern == P_STRONG_DOWN
+        mult := tp_strong_down_tp1
+    if regime == R_WIDE
+        mult := math.min(mult, tp_wide_cap)
+    if etype == "E2" and enable_retouch_decay
+        mult *= e2_target_factor
+    float tp = break_dir == 1 ? or_high + mult * or_range : or_low - mult * or_range
+    tp
+
+// =============================================================================
+// SECTION 11 — TRADERSPOST JSON BUILDERS
+// =============================================================================
+//
+// Three payload shapes (documented at top of file):
+//
+//   ENTRY:    {"ticker":"MNQ","action":"buy", "quantity":1,"signalId":"E0_ENTRY"}
+//   PER-EXIT: {"ticker":"MNQ","action":"exit","quantity":1,"signalId":"E0_STOP"}
+//   FLATTEN:  {"ticker":"MNQ","action":"exit","sentiment":"flat","signalId":"SESSION_END"}
+
+build_entry_json(string action, string signalId, int qty) =>
+    '{"ticker":"' + traderspost_symbol + '","action":"' + action + '","quantity":' + str.tostring(qty) + ',"signalId":"' + signalId + '"}'
+
+build_perentry_exit_json(string signalId, int qty) =>
+    '{"ticker":"' + traderspost_symbol + '","action":"exit","quantity":' + str.tostring(qty) + ',"signalId":"' + signalId + '"}'
+
+build_flatten_json(string signalId) =>
+    '{"ticker":"' + traderspost_symbol + '","action":"exit","sentiment":"flat","signalId":"' + signalId + '"}'
+
+// =============================================================================
+// SECTION 12 — ENTRY LOGIC (E0, E1, E2)
+// =============================================================================
+
+// E0 — Initial break entry (fires on the break bar)
+if bar_index == break_idx and enable_e0
+    if day_entry_cnt >= max_entries_per_day
+        block_reason := "MAX ENTRIES"
+    else if not filter_ok and enable_shape_filter and pattern != ""
+        block_reason := "SHAPE FILTER"
+    else if not filter_ok and enable_score_filter
+        block_reason := "SCORE FILTER"
+    else if break_dir == 0
+        block_reason := "NO BREAK"
+    else
+        block_reason := na
+
+if enable_e0 and bar_index == break_idx and day_entry_cnt < max_entries_per_day and filter_ok
+    qty               = e0_base * size_mult
+    e0_active_qty    := qty
+    e0_stop          := get_initial_stop("E0")
+    e0_tp            := get_initial_tp("E0")
+    e0_partial_taken := false
+    strategy.entry("E0", break_dir == 1 ? strategy.long : strategy.short, qty = qty)
+    day_entry_cnt += 1
+    if show_entry_labels
+        label.new(bar_index, break_dir == 1 ? low - 8 : high + 8, "E0",
+            color = color.blue, textcolor = color.white,
+            style = break_dir == 1 ? label.style_label_up : label.style_label_down,
+            size = size.normal)
+    // ALERT JSON: {"ticker":"MNQ","action":"buy","quantity":1,"signalId":"E0_ENTRY"}
+    if enable_traderspost_alerts
+        alert(build_entry_json(break_dir == 1 ? "buy" : "sell", "E0_ENTRY", qty), alert.freq_once_per_bar)
+
+// "NO TRADE" debug label
+if enable_e0 and bar_index == break_idx and not (day_entry_cnt < max_entries_per_day and filter_ok) and not na(block_reason) and show_debug_labels
+    label.new(bar_index + 3, break_dir == 1 ? high + 15 : low - 15, "NO TRADE: " + block_reason,
+        color = color.orange, textcolor = color.white,
+        style = break_dir == 1 ? label.style_label_down : label.style_label_up,
+        size = size.small)
+
+// Retouch detection (fires E1 / E2)
+in_rz = break_dir == 1 ? (low  <= or_high + retouch_touch_zone) : (high >= or_low - retouch_touch_zone)
+cn_rz = break_dir == 1 ? (close > or_high + 3)                  : (close < or_low  - 3)
+
+if break_dir != 0 and bar_index > break_idx and in_rz and cn_rz and bar_index > last_r_b + 1
+    retouch_cnt += 1
+    last_r_b     := bar_index
+
+    if filter_ok and day_entry_cnt < max_entries_per_day
+        // E1 — First retouch
+        if retouch_cnt == 1 and enable_e1
+            qty               = e1_base * size_mult
+            e1_active_qty    := qty
+            e1_stop          := get_initial_stop("E1")
+            e1_tp            := get_initial_tp("E1")
+            e1_partial_taken := false
+            strategy.entry("E1", break_dir == 1 ? strategy.long : strategy.short, qty = qty)
+            day_entry_cnt += 1
+            if show_entry_labels
+                label.new(bar_index, break_dir == 1 ? low - 18 : high + 18, "E1",
+                    color = color.green, textcolor = color.white,
+                    style = break_dir == 1 ? label.style_label_up : label.style_label_down,
+                    size = size.normal)
+            // ALERT JSON: {"ticker":"MNQ","action":"buy","quantity":1,"signalId":"E1_ENTRY"}
+            if enable_traderspost_alerts
+                alert(build_entry_json(break_dir == 1 ? "buy" : "sell", "E1_ENTRY", qty), alert.freq_once_per_bar)
+
+        // E2 — Second retouch
+        else if retouch_cnt == 2 and enable_e2
+            qty               = e2_base * size_mult
+            e2_active_qty    := qty
+            e2_stop          := get_initial_stop("E2")
+            e2_tp            := get_initial_tp("E2")
+            e2_partial_taken := false
+            strategy.entry("E2", break_dir == 1 ? strategy.long : strategy.short, qty = qty)
+            day_entry_cnt += 1
+            if show_entry_labels
+                label.new(bar_index + 6, break_dir == 1 ? low - 28 : high + 28, "E2",
+                    color = color.teal, textcolor = color.white,
+                    style = break_dir == 1 ? label.style_label_up : label.style_label_down,
+                    size = size.normal)
+            // ALERT JSON: {"ticker":"MNQ","action":"buy","quantity":1,"signalId":"E2_ENTRY"}
+            if enable_traderspost_alerts
+                alert(build_entry_json(break_dir == 1 ? "buy" : "sell", "E2_ENTRY", qty), alert.freq_once_per_bar)
+
+// =============================================================================
+// SECTION 13 — STOP RATCHET & CLEAN BREAK TP UPGRADE
+// =============================================================================
+//
+// On every bar with an open position, update each entry's stop and TP.
+// Ratchets only TIGHTEN stops (never loosen). Clean break only RAISES TPs.
+
+apply_ratchet_and_clean_break(float stop_val, float tp_val, string etype) =>
+    float s = stop_val
+    float t = tp_val
+
+    // Clean break TP upgrade (raises target only)
+    if enable_clean_break and clean_break_act
+        m   = pattern == P_V_SHAPE ? tp_v_shape_tp2 : clean_break_target
+        utp = break_dir == 1 ? or_high + m * or_range : or_low - m * or_range
+        t  := break_dir == 1 ? math.max(t, utp) : math.min(t, utp)
+
+    // Stop ratchets by regime
+    if regime == R_MEDIUM
+        if etype == "E0"
+            if max_fav_exc >= m_e0_adj2_trigger * or_range
+                s := break_dir == 1 ? math.max(s, or_high) : math.min(s, or_low)
+            else if max_fav_exc >= m_e0_adj1_trigger * or_range
+                s := break_dir == 1 ? math.max(s, or_mid) : math.min(s, or_mid)
+        else if (etype == "E1" or etype == "E2") and max_fav_exc >= m_e1_adj2_trigger * or_range
+            s := break_dir == 1 ? math.max(s, or_high) : math.min(s, or_low)
+    else if regime == R_NARROW and max_fav_exc >= narrow_be_trigger * or_range
+        s := break_dir == 1 ? math.max(s, or_high) : math.min(s, or_low)
+    else if regime == R_WIDE and max_fav_exc >= wide_be_trigger * or_range
+        s := break_dir == 1 ? math.max(s, or_high) : math.min(s, or_low)
+
+    // Retouch count cap on TP
+    if enable_retouch_modifier and retouch_cnt >= retouch_reduce_at
+        cap = break_dir == 1 ? or_high + retouch_cap_after_n * or_range : or_low - retouch_cap_after_n * or_range
+        t  := break_dir == 1 ? math.min(t, cap) : math.max(t, cap)
+
+    [s, t]
+
+if e0_active_qty > 0
+    [s0, t0] = apply_ratchet_and_clean_break(e0_stop, e0_tp, "E0")
+    e0_stop := s0
+    e0_tp   := t0
+if e1_active_qty > 0
+    [s1, t1] = apply_ratchet_and_clean_break(e1_stop, e1_tp, "E1")
+    e1_stop := s1
+    e1_tp   := t1
+if e2_active_qty > 0
+    [s2, t2] = apply_ratchet_and_clean_break(e2_stop, e2_tp, "E2")
+    e2_stop := s2
+    e2_tp   := t2
+
+// =============================================================================
+// SECTION 14 — PER-ENTRY EXIT DETECTION & ALERTS
+// =============================================================================
+//
+// For each active entry, check stop/TP hit on this bar.
+// Hit detection mirrors what a market broker sees: low <= stop for longs,
+// high >= TP for longs; reversed for shorts. Stop check first (conservative).
+//
+// WEAK UP PARTIAL (Path D — qty >= 2 only):
+//   First TP hit → close 50%, switch stop to broken level, no upper TP (trail).
+//   When trail stop hits → close remaining, fire entry's TRAIL alert.
+//
+// NOTE: strategy.close() fills at bar close, not at the exact stop/TP price.
+// Keeps alert + fill atomic. Slight backtest imprecision documented.
+
+// --- E0 ---
+if e0_active_qty > 0
+    long_dir   = break_dir == 1
+    stop_hit_0 = long_dir ? low  <= e0_stop : high >= e0_stop
+    tp_hit_0   = long_dir ? high >= e0_tp   : low  <= e0_tp
+
+    if stop_hit_0
+        sig_e0 = e0_partial_taken ? "E0_TRAIL" : "E0_STOP"
+        strategy.close("E0", qty = e0_active_qty, comment = sig_e0)
+        // ALERT JSON: {"ticker":"MNQ","action":"exit","quantity":1,"signalId":"E0_STOP"}
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json(sig_e0, e0_active_qty), alert.freq_once_per_bar)
+        e0_active_qty := 0
+        e0_stop       := na
+        e0_tp         := na
+    else if tp_hit_0 and not e0_partial_taken and enable_weak_up_partial and pattern == P_WEAK_UP and e0_active_qty >= 2
+        // Weak Up partial: close half, switch to trail
+        half = e0_active_qty / 2
+        strategy.close("E0", qty = half, comment = "E0_TP1 partial")
+        // ALERT JSON: {"ticker":"MNQ","action":"exit","quantity":1,"signalId":"E0_TP1"}
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E0_TP1", half), alert.freq_once_per_bar)
+        e0_active_qty    := e0_active_qty - half
+        e0_partial_taken := true
+        e0_stop          := break_dir == 1 ? or_high : or_low
+        e0_tp            := na
+    else if tp_hit_0
+        // Full TP exit
+        strategy.close("E0", qty = e0_active_qty, comment = "E0_TP")
+        // ALERT JSON: {"ticker":"MNQ","action":"exit","quantity":1,"signalId":"E0_TP"}
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E0_TP", e0_active_qty), alert.freq_once_per_bar)
+        e0_active_qty := 0
+        e0_stop       := na
+        e0_tp         := na
+
+// --- E1 ---
+if e1_active_qty > 0
+    long_dir   = break_dir == 1
+    stop_hit_1 = long_dir ? low  <= e1_stop : high >= e1_stop
+    tp_hit_1   = long_dir ? high >= e1_tp   : low  <= e1_tp
+
+    if stop_hit_1
+        sig_e1 = e1_partial_taken ? "E1_TRAIL" : "E1_STOP"
+        strategy.close("E1", qty = e1_active_qty, comment = sig_e1)
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json(sig_e1, e1_active_qty), alert.freq_once_per_bar)
+        e1_active_qty := 0
+        e1_stop       := na
+        e1_tp         := na
+    else if tp_hit_1 and not e1_partial_taken and enable_weak_up_partial and pattern == P_WEAK_UP and e1_active_qty >= 2
+        half = e1_active_qty / 2
+        strategy.close("E1", qty = half, comment = "E1_TP1 partial")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E1_TP1", half), alert.freq_once_per_bar)
+        e1_active_qty    := e1_active_qty - half
+        e1_partial_taken := true
+        e1_stop          := break_dir == 1 ? or_high : or_low
+        e1_tp            := na
+    else if tp_hit_1
+        strategy.close("E1", qty = e1_active_qty, comment = "E1_TP")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E1_TP", e1_active_qty), alert.freq_once_per_bar)
+        e1_active_qty := 0
+        e1_stop       := na
+        e1_tp         := na
+
+// --- E2 ---
+if e2_active_qty > 0
+    long_dir   = break_dir == 1
+    stop_hit_2 = long_dir ? low  <= e2_stop : high >= e2_stop
+    tp_hit_2   = long_dir ? high >= e2_tp   : low  <= e2_tp
+
+    if stop_hit_2
+        sig_e2 = e2_partial_taken ? "E2_TRAIL" : "E2_STOP"
+        strategy.close("E2", qty = e2_active_qty, comment = sig_e2)
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json(sig_e2, e2_active_qty), alert.freq_once_per_bar)
+        e2_active_qty := 0
+        e2_stop       := na
+        e2_tp         := na
+    else if tp_hit_2 and not e2_partial_taken and enable_weak_up_partial and pattern == P_WEAK_UP and e2_active_qty >= 2
+        half = e2_active_qty / 2
+        strategy.close("E2", qty = half, comment = "E2_TP1 partial")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E2_TP1", half), alert.freq_once_per_bar)
+        e2_active_qty    := e2_active_qty - half
+        e2_partial_taken := true
+        e2_stop          := break_dir == 1 ? or_high : or_low
+        e2_tp            := na
+    else if tp_hit_2
+        strategy.close("E2", qty = e2_active_qty, comment = "E2_TP")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E2_TP", e2_active_qty), alert.freq_once_per_bar)
+        e2_active_qty := 0
+        e2_stop       := na
+        e2_tp         := na
+
+// =============================================================================
+// SECTION 15 — FORCED FLATTEN CONDITIONS (single guard, max one alert/bar)
+// =============================================================================
+//
+// Four conditions can force-flatten everything. Shared guard ensures only ONE
+// flatten alert fires per bar — first condition to trigger wins.
+//
+//   1. NARROW Time Stop — cross-back within N min in NARROW regime
+//   2. Opposite OR Level — price tests opposite OR boundary
+//   3. Deep Cross-Back   — held back inside the OR for too long
+//   4. Session End       — 15:55 ET belt-and-suspenders flatten
+
+total_active = e0_active_qty + e1_active_qty + e2_active_qty
+
+// --- 1. NARROW Time Stop ---
+if total_active > 0 and not exit_triggered_this_bar and regime == R_NARROW and narrow_stop_type != "OR_LOW"
+    crossed_back  = break_dir == 1 ? close < or_high : close > or_low
+    within_window = (bar_index - break_idx) <= int(narrow_time_stop_mins / 5)
+    e0_only_pass  = narrow_time_stop_e0_only ? (e1_active_qty == 0 and e2_active_qty == 0) : true
+    if crossed_back and within_window and e0_only_pass
+        strategy.close_all(comment = "TIME_STOP")
+        // ALERT JSON: {"ticker":"MNQ","action":"exit","sentiment":"flat","signalId":"TIME_STOP"}
+        if enable_traderspost_alerts
+            alert(build_flatten_json("TIME_STOP"), alert.freq_once_per_bar)
+        exit_triggered_this_bar := true
+
+// --- 2. Opposite OR Level test ---
+if total_active > 0 and not exit_triggered_this_bar and enable_opposite_exit
+    opposite_hit = break_dir == 1 ? low <= or_low + opposite_exit_zone : high >= or_high - opposite_exit_zone
+    if opposite_hit
+        strategy.close_all(comment = "OPPOSITE_LEVEL")
+        // ALERT JSON: {"ticker":"MNQ","action":"exit","sentiment":"flat","signalId":"OPPOSITE_LEVEL"}
+        if enable_traderspost_alerts
+            alert(build_flatten_json("OPPOSITE_LEVEL"), alert.freq_once_per_bar)
+        exit_triggered_this_bar := true
+
+// Track bars where price closed back inside the OR (Deep Cross-Back input)
+in_range_now = break_dir == 1 ? (close < or_high) : (close > or_low)
+if in_range_now
+    b_in_r += 1
+else
+    b_in_r := 0
+
+// --- 3. Deep Cross-Back ---
+if total_active > 0 and not exit_triggered_this_bar and enable_deep_crossback_exit and not na(or_range)
+    dep           = break_dir == 1 ? (or_high - close) / or_range : (close - or_low) / or_range
+    sha           = enable_shallow_hold and dep < shallow_depth_max and b_in_r < shallow_duration_max
+    fae_protected = deep_exit_fae_guard > 0 and max_fav_exc >= deep_exit_fae_guard * or_range
+    e0_eligible   = e0_active_qty > 0 and deep_exit_e0
+    e1_eligible   = e1_active_qty > 0 and deep_exit_e1
+    e2_eligible   = e2_active_qty > 0 and deep_exit_e2
+    entry_allows  = e0_eligible or e1_eligible or e2_eligible
+    if not sha and dep > crossback_depth_exit and b_in_r > crossback_dur_exit and not fae_protected and entry_allows
+        strategy.close_all(comment = "DEEP_EXIT")
+        // ALERT JSON: {"ticker":"MNQ","action":"exit","sentiment":"flat","signalId":"DEEP_EXIT"}
+        if enable_traderspost_alerts
+            alert(build_flatten_json("DEEP_EXIT"), alert.freq_once_per_bar)
+        exit_triggered_this_bar := true
+
+// --- 4. Session End (fires even if flat — belt-and-suspenders) ---
+if t_val >= tr_e_v and not exit_triggered_this_bar
+    if total_active > 0
+        strategy.close_all(comment = "SESSION_END")
+    // TradersPost no-ops if account is flat; closes any orphan contracts if not.
+    // ALERT JSON: {"ticker":"MNQ","action":"exit","sentiment":"flat","signalId":"SESSION_END"}
+    if enable_traderspost_alerts
+        alert(build_flatten_json("SESSION_END"), alert.freq_once_per_bar)
+    exit_triggered_this_bar := true
+
+// --- Reset per-entry state if any forced flatten fired this bar ---
+// Inline (not a function) because Pine v6 functions cannot mutate globals.
+if exit_triggered_this_bar
+    e0_active_qty    := 0
+    e0_stop          := na
+    e0_tp            := na
+    e0_partial_taken := false
+    e1_active_qty    := 0
+    e1_stop          := na
+    e1_tp            := na
+    e1_partial_taken := false
+    e2_active_qty    := 0
+    e2_stop          := na
+    e2_tp            := na
+    e2_partial_taken := false
+
+// =============================================================================
+// SECTION 16 — VISUALIZATION
+// =============================================================================
+
+plot(not na(or_high) and or_classified ? or_high : na, "OR High",     color.new(color.green, 0),  2, plot.style_linebr)
+plot(not na(or_low)  and or_classified ? or_low  : na, "OR Low",      color.new(color.red,   0),  2, plot.style_linebr)
+plot(not na(or_mid)  and show_midpoint  ? or_mid  : na, "OR Midpoint", color.new(color.gray, 50),  1, plot.style_linebr)
+
+if show_composite and or_classified and not or_classified[1] and not na(or_high) and not na(or_open)
+    bull     = or_close >= or_open
+    body_top = math.max(or_open, or_close)
+    body_bot = math.min(or_open, or_close)
+    body_col = bull ? comp_bull_color : comp_bear_color
+    wick_col = bull ? color.new(#26a69a, 0) : color.new(#ef5350, 0)
+
+    x1    = bar_index - 5
+    x2    = bar_index - 1
+    x_mid = int((x1 + x2) / 2)
+
+    box.new(left = x1, top = body_top, right = x2, bottom = body_bot,
+        bgcolor = body_col, border_color = color.gray,
+        border_width = 1, border_style = line.style_dotted)
+
+    if or_high > body_top
+        line.new(x1 = x_mid, y1 = body_top, x2 = x_mid, y2 = or_high, color = wick_col, width = comp_wick_width)
+    if or_low < body_bot
+        line.new(x1 = x_mid, y1 = body_bot, x2 = x_mid, y2 = or_low,  color = wick_col, width = comp_wick_width)
+
+    body_mid_price = (body_top + body_bot) / 2
+    line.new(x1 = x1, y1 = body_mid_price, x2 = x2, y2 = body_mid_price,
+        color = color.new(color.white, 70), width = 1, style = line.style_dotted)
+
+    upper_wick = or_high - body_top
+    lower_wick = body_bot - or_low
+    upper_pct  = or_range > 0 ? (upper_wick / or_range) * 100 : 0.0
+    lower_pct  = or_range > 0 ? (lower_wick / or_range) * 100 : 0.0
+
+    trade_bias = switch pattern
+        P_STRONG_UP   => "LONG"
+        P_STRONG_DOWN => "SHORT"
+        P_V_SHAPE     => "LONG"
+        P_INV_V       => "SHORT"
+        P_WEAK_UP     => "LONG (cautious)"
+        P_WEAK_DOWN   => "SHORT (fade)"
+        => "?"
+
+    if show_pattern_label
+        pat_short = switch pattern
+            P_V_SHAPE     => "V-Shape"
+            P_INV_V       => "Inv-V"
+            P_WEAK_UP     => "Weak Up"
+            P_WEAK_DOWN   => "Weak Down"
+            P_STRONG_UP   => "Strong Up"
+            P_STRONG_DOWN => "Strong Down"
+            => "?"
+
+        label.new(x = x_mid, y = bull ? or_high + 80 : or_low - 80,
+            text = pat_short + "\n" + regime + " " + trade_bias + "\n" +
+                str.tostring(math.round(or_range)) + "pts | " +
+                "U=" + str.tostring(math.round(upper_pct)) + "% " +
+                "L=" + str.tostring(math.round(lower_pct)) + "%",
+            color = color.rgb(100, 181, 246), textcolor = color.white,
+            style = bull ? label.style_label_down : label.style_label_up,
+            size = size.small,
+            text_font_family = font.family_default,
+            text_formatting = text.format_bold)
+
+        if upper_wick > 0
+            label.new(x = x_mid, y = or_high + 25,
+                text = "▲" + str.tostring(math.round(upper_pct)) + "%",
+                color = color.new(color.gray, 70), textcolor = color.white,
+                style = label.style_label_down, size = size.tiny,
+                text_font_family = font.family_default)
+        if lower_wick > 0
+            label.new(x = x_mid, y = or_low - 25,
+                text = "▼" + str.tostring(math.round(lower_pct)) + "%",
+                color = color.new(color.gray, 70), textcolor = color.white,
+                style = label.style_label_up, size = size.tiny,
+                text_font_family = font.family_default)
+
+// =============================================================================
+// SECTION 17 — INFO TABLE
+// =============================================================================
+
+tbl_set(t, r, k, v, vc) =>
+    table.cell(t, 0, r, k, text_color = color.new(color.gray, 20), text_size = size.small)
+    table.cell(t, 1, r, v, text_color = vc,                        text_size = size.small)
+
+if barstate.islastconfirmedhistory
+    var table tbl = na
+    if na(tbl)
+        tbl := table.new(position.top_right, 2, 9,
+            bgcolor      = color.new(color.black, 50),
+            border_width = 1,
+            border_color = color.white)
+
+    tbl_set(tbl, 0, "Regime",     regime,                                color.white)
+    tbl_set(tbl, 1, "Pattern",    pattern,                               color.white)
+    tbl_set(tbl, 2, "Score",      str.tostring(score) + "/5",            score >= min_score ? color.green : color.red)
+    tbl_set(tbl, 3, "OR Range",   str.tostring(or_range, "#.#") + "pts", color.white)
+    tbl_set(tbl, 4, "Clean Brk",  clean_break_act ? "YES ★" : "no",      clean_break_act ? color.green : color.gray)
+    tbl_set(tbl, 5, "Max Exc",    str.tostring(max_fav_exc, "#.#") + "pts (" +
+                                  str.tostring(not na(or_range) and or_range > 0 ? math.round(max_fav_exc / or_range * 100) : 0) + "%OR)", color.white)
+    tbl_set(tbl, 6, "Retouches",  str.tostring(retouch_cnt),             retouch_cnt >= retouch_reduce_at ? color.orange : color.white)
+    tbl_set(tbl, 7, "Entries",    str.tostring(day_entry_cnt) + "/" + str.tostring(max_entries_per_day), color.white)
+    tbl_set(tbl, 8, "Active Qty", str.tostring(e0_active_qty + e1_active_qty + e2_active_qty), color.white)
+
+// =============================================================================
+// SECTION 18 — ALERT TEST MODE
+// =============================================================================
+//
+// Enable in inputs to fire one of every payload shape on the last bar.
+// Use to verify TradersPost receives correctly formatted JSON before going live.
+// REMEMBER TO DISABLE before real trading.
+
+if barstate.islast and alert_test_mode and enable_traderspost_alerts
+    // Entry shapes
+    alert(build_entry_json("buy",  "E0_ENTRY", 1), alert.freq_all)
+    alert(build_entry_json("sell", "E1_ENTRY", 1), alert.freq_all)
+    // Per-entry exit shapes
+    alert(build_perentry_exit_json("E0_STOP",  1), alert.freq_all)
+    alert(build_perentry_exit_json("E0_TP",    1), alert.freq_all)
+    alert(build_perentry_exit_json("E0_TP1",   1), alert.freq_all)
+    alert(build_perentry_exit_json("E0_TRAIL", 1), alert.freq_all)
+    // Forced flatten shapes
+    alert(build_flatten_json("TIME_STOP"),      alert.freq_all)
+    alert(build_flatten_json("OPPOSITE_LEVEL"), alert.freq_all)
+    alert(build_flatten_json("DEEP_EXIT"),      alert.freq_all)
+    alert(build_flatten_json("SESSION_END"),    alert.freq_all)
