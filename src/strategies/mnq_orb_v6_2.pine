@@ -609,9 +609,7 @@ if bar_index == break_idx and enable_e0
 
     // NO_TRADE log — fires once on the break bar when E0 was eligible to consider but skipped
     if enable_traderspost_alerts and enable_notrade_log and not na(block_reason)
-        reason_code = block_reason == "MAX ENTRIES"  ? "MAX_ENTRIES"
-                    : block_reason == "NO BREAK"     ? "NO_BREAK"
-                    : "FILTER"
+        reason_code = block_reason == "MAX ENTRIES" ? "MAX_ENTRIES" : block_reason == "NO BREAK" ? "NO_BREAK" : "FILTER"
         e0_detail = na(filter_fail) ? block_reason : filter_fail
         alert(build_notrade_json("E0", reason_code, e0_detail), alert.freq_once_per_bar)
 
@@ -652,9 +650,7 @@ if break_dir != 0 and bar_index > break_idx and in_rz and cn_rz and bar_index > 
     slot_off  = (retouch_cnt == 1 and not enable_e1) or (retouch_cnt == 2 and not enable_e2)
     rt_blocked = not (filter_ok and day_entry_cnt < max_entries_per_day) or slot_off
     if enable_traderspost_alerts and enable_notrade_log and rt_blocked and retouch_cnt <= 2
-        rt_reason = day_entry_cnt >= max_entries_per_day ? "MAX_ENTRIES"
-                  : slot_off                             ? "SLOT_DISABLED"
-                  : "FILTER"
+        rt_reason = day_entry_cnt >= max_entries_per_day ? "MAX_ENTRIES" : slot_off ? "SLOT_DISABLED" : "FILTER"
         rt_detail = na(filter_fail) ? "" : filter_fail
         alert(build_notrade_json(rt_slot, rt_reason, rt_detail), alert.freq_once_per_bar)
 
