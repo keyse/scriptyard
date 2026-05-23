@@ -1,0 +1,507 @@
+// =============================================================================
+// MNQ ORB Breakout — v7 Lean (Reference Implementation for A/B Test vs v6)
+// =============================================================================
+//
+// PURPOSE
+//   A stripped-down ORB built from published research consensus
+//   (Zarattini-Aziz 2023, Mark Fisher ACD, Toby Crabel ORE). Designed to be
+//   benchmarked against mnq_orb_v6_2.pine — if v6's extra machinery
+//   (6-pattern classifier, 0-5 score, 3-regime ratchet matrix, 3 overlapping
+//   failure exits) is paying for itself, v6 wins the Sharpe race.
+//   If it isn't, the bloat is overfit and v7 should be promoted.
+//
+// WHAT WAS REMOVED FROM v6
+//   - OR-candle pattern classifier (V/INV-V/Weak/Strong × Up/Down)
+//   - Conviction score (0-5) and its 5 sub-scores
+//   - Regime-conditional initial-stop matrix
+//   - Multi-step stop ratchet (4 trigger lanes by regime/slot)
+//   - NARROW time stop
+//   - Deep cross-back exit (with shallow-hold + FAE guard)
+//   - Per-pattern TP multipliers (6 of them) and WIDE cap
+//   - Retouch decay + retouch count cap
+//   - Clean break TP upgrade
+//   - Weak Up partial exit (Path D)
+//   - E2 (second retouch) entry slot
+//
+// WHAT WAS KEPT FROM v6
+//   - 20-minute OR (9:30-9:50 ET) — for fair A/B on the window
+//   - Directional lockout (first break locks direction)
+//   - Wick-based break with N-pt confirmation buffer
+//   - TradersPost JSON alert architecture (3 payload shapes)
+//   - NO_TRADE / DAILY_SUMMARY observability
+//   - Session-end forced flatten (15:55 ET)
+//   - process_orders_on_close = true (high backtest fidelity)
+//
+// ENTRY GATES (v7 — exactly two binary checks)
+//   1. OR candle closed in the break direction
+//      (long break needs or_close > or_open; short break needs or_close < or_open)
+//   2. |or_close - or_open| / or_range >= body_min_pct  (default 0.30)
+//   Both true → trade. Either false → NO_TRADE log + skip.
+//
+// EXIT MODEL (v7 — exactly four reasons to leave)
+//   A. Initial stop = opposite OR level
+//   B. Move stop to break level when MFE >= 1.0 × OR
+//   C. Take-profit at break_level ± tp_mult × OR  (default 2.0)
+//   D. Forced flatten on opposite-OR test  OR  session end
+//
+// =============================================================================
+
+//@version=6
+strategy(
+    title             = "MNQ ORB v7 Lean",
+    shorttitle        = "MNQ ORB v7",
+    overlay           = true,
+
+    // E0 + optional E1 = max 2 simultaneous separate entries.
+    pyramiding        = 2,
+
+    default_qty_type  = strategy.fixed,
+    default_qty_value = 1,
+    initial_capital   = 10000,
+    commission_type   = strategy.commission.cash_per_contract,
+    commission_value  = 0.62,
+    slippage          = 1,
+    margin_long       = 50,
+    margin_short      = 50,
+
+    calc_on_every_tick      = false,
+    process_orders_on_close = true,
+
+    max_boxes_count   = 500,
+    max_lines_count   = 500,
+    max_labels_count  = 500
+)
+
+// =============================================================================
+// SECTION 1 — INPUTS  (target: under 15 user-facing knobs)
+// =============================================================================
+
+// --- OR Window ---
+or_start_hour    = input.int(9,  "OR start hour (ET)",            group = "OR Window")
+or_start_min     = input.int(30, "OR start minute",               group = "OR Window")
+or_end_hour      = input.int(9,  "OR end hour (ET)",              group = "OR Window")
+or_end_min       = input.int(50, "OR end minute",                 group = "OR Window")
+session_end_hour = input.int(15, "Session end hour (force flat)", group = "OR Window")
+session_end_min  = input.int(55, "Session end minute",            group = "OR Window")
+tz_input         = input.string("America/New_York", "Timezone",   group = "OR Window")
+
+// --- Entry Gates (the only two filters) ---
+require_body_aligned = input.bool(true,  "Gate 1: OR candle closed in break direction", group = "Entry Gates")
+body_min_pct         = input.float(0.30, "Gate 2: |body| / OR_range minimum",           group = "Entry Gates", minval=0, maxval=1, step=0.05)
+break_confirm_pts    = input.float(5,    "Break confirmation buffer (pts beyond OR)",   group = "Entry Gates")
+
+// --- Entries ---
+enable_e0           = input.bool(true,  "E0: enter on initial break",   group = "Entries")
+enable_e1           = input.bool(true,  "E1: enter on first retouch",   group = "Entries")
+retouch_touch_zone  = input.float(10,   "Retouch zone (pts from OR)",   group = "Entries")
+qty_per_entry       = input.int(1,      "Quantity per entry",           group = "Entries", minval=1)
+
+// --- Targets & Stops (single rule each) ---
+tp_mult       = input.float(2.0, "TP multiplier (× OR range)",                 group = "Targets & Stops", minval=0.25, step=0.25)
+be_trigger    = input.float(1.0, "Move stop to break-level after MFE >= × OR", group = "Targets & Stops", minval=0, step=0.1)
+
+// --- Forced Flatten ---
+enable_opposite_exit = input.bool(true, "Flatten when opposite OR level tested", group = "Forced Flatten")
+opposite_exit_zone   = input.float(10,  "Opposite exit zone (pts from level)",   group = "Forced Flatten")
+
+// --- TradersPost Alerts ---
+enable_traderspost_alerts = input.bool(true,  "Enable TradersPost alerts",                     group = "TradersPost Alerts")
+traderspost_symbol        = input.string("MNQ", "TradersPost ticker (MNQ — not MNQ1!)",        group = "TradersPost Alerts")
+enable_notrade_log        = input.bool(true,  "Log NO_TRADE / DAILY_SUMMARY as alerts",        group = "TradersPost Alerts")
+alert_test_mode           = input.bool(false, "TEST MODE — fires sample JSONs on last bar",    group = "TradersPost Alerts")
+
+// --- Visuals ---
+show_entry_labels = input.bool(true, "Show entry labels (E0/E1)",    group = "Visuals")
+show_debug_labels = input.bool(true, "Show 'NO TRADE' debug labels", group = "Visuals")
+show_midpoint     = input.bool(true, "Show OR midpoint line",        group = "Visuals")
+
+// =============================================================================
+// SECTION 2 — STATE
+// =============================================================================
+
+is_new_day = ta.change(time("D", tz_input)) != 0
+
+// OR
+var float or_high  = na
+var float or_low   = na
+var float or_mid   = na
+var float or_open  = na
+var float or_close = na
+var float or_range = na
+var bool  or_classified = false
+
+// Break (directional lockout)
+var int break_dir = 0   // 0 none, 1 bull, -1 bear
+var int break_idx = na
+
+// Retouch & entry counters
+var int retouch_cnt   = 0
+var int day_entry_cnt = 0
+var int last_r_b      = 0
+
+// MFE — drives BE ratchet
+var float max_fav_exc = 0.0
+
+// Per-entry state
+var int   e0_qty  = 0
+var float e0_stop = na
+var float e0_tp   = na
+
+var int   e1_qty  = 0
+var float e1_stop = na
+var float e1_tp   = na
+
+// Guards
+var bool exit_triggered_this_bar = false
+var bool session_end_fired       = false
+
+// Debug
+var string block_reason = na
+
+// =============================================================================
+// SECTION 3 — TIME & SESSION RESET
+// =============================================================================
+
+t_hour = hour(time, tz_input)
+t_min  = minute(time, tz_input)
+t_val  = t_hour * 100 + t_min
+
+or_s_v = or_start_hour    * 100 + or_start_min
+or_e_v = or_end_hour      * 100 + or_end_min
+tr_e_v = session_end_hour * 100 + session_end_min
+
+is_or_window      = t_val >= or_s_v and t_val < or_e_v
+is_or_complete    = t_val >= or_e_v and t_val[1] < or_e_v
+is_trading_window = t_val >= or_e_v and t_val < tr_e_v
+
+if is_new_day
+    or_high       := na
+    or_low        := na
+    or_mid        := na
+    or_open       := na
+    or_close      := na
+    or_range      := na
+    or_classified := false
+    break_dir     := 0
+    break_idx     := na
+    retouch_cnt   := 0
+    day_entry_cnt := 0
+    last_r_b      := 0
+    max_fav_exc   := 0.0
+    block_reason  := na
+    session_end_fired := false
+    e0_qty  := 0
+    e0_stop := na
+    e0_tp   := na
+    e1_qty  := 0
+    e1_stop := na
+    e1_tp   := na
+
+if barstate.isnew
+    exit_triggered_this_bar := false
+
+// =============================================================================
+// SECTION 4 — OR BUILDING
+// =============================================================================
+
+if is_or_window
+    if na(or_high)
+        or_high := high
+        or_low  := low
+        or_open := open
+    else
+        or_high := math.max(or_high, high)
+        or_low  := math.min(or_low,  low)
+    // capture or_close on the last OR bar (close of the 9:45 bar = 9:50)
+    or_close := close
+
+if is_or_complete and not or_classified and not na(or_high)
+    or_range      := or_high - or_low
+    or_mid        := (or_high + or_low) / 2
+    or_classified := true
+
+// =============================================================================
+// SECTION 5 — BREAK DETECTION (with directional lockout)
+// =============================================================================
+
+is_bull_break = break_dir == 0 and is_trading_window and not na(or_high) and high > or_high + break_confirm_pts and low  >= or_low
+is_bear_break = break_dir == 0 and is_trading_window and not na(or_low)  and low  < or_low  - break_confirm_pts and high <= or_high
+
+if is_bull_break
+    break_dir := 1
+    break_idx := bar_index
+if is_bear_break
+    break_dir := -1
+    break_idx := bar_index
+
+// =============================================================================
+// SECTION 6 — ENTRY GATES (exactly 2)
+// =============================================================================
+
+body_aligned_ok = not require_body_aligned or (
+     not na(or_close) and not na(or_open) and (
+         (break_dir ==  1 and or_close > or_open) or
+         (break_dir == -1 and or_close < or_open)))
+
+body_pct = (not na(or_range) and or_range > 0 and not na(or_close) and not na(or_open)) ?
+     math.abs(or_close - or_open) / or_range : 0.0
+body_size_ok = body_pct >= body_min_pct
+
+filter_ok = body_aligned_ok and body_size_ok
+
+filter_fail_reason = not body_aligned_ok ? "BODY_NOT_ALIGNED" :
+     not body_size_ok ? ("BODY_PCT:" + str.tostring(body_pct, "#.##") + "<" + str.tostring(body_min_pct, "#.##")) : ""
+
+// =============================================================================
+// SECTION 7 — TP / STOP HELPERS
+// =============================================================================
+
+initial_stop() =>
+    break_dir == 1 ? or_low : or_high
+
+initial_tp() =>
+    break_dir == 1 ? or_high + tp_mult * or_range : or_low - tp_mult * or_range
+
+// =============================================================================
+// SECTION 8 — TRADERSPOST JSON BUILDERS
+// =============================================================================
+
+build_entry_json(string action, string signalId, int qty) =>
+    '{"ticker":"' + traderspost_symbol + '","action":"' + action + '","quantity":' + str.tostring(qty) + ',"signalId":"' + signalId + '"}'
+
+build_perentry_exit_json(string signalId, int qty) =>
+    '{"ticker":"' + traderspost_symbol + '","action":"exit","quantity":' + str.tostring(qty) + ',"signalId":"' + signalId + '"}'
+
+build_flatten_json(string signalId) =>
+    '{"ticker":"' + traderspost_symbol + '","action":"exit","sentiment":"flat","signalId":"' + signalId + '"}'
+
+build_notrade_json(string slot, string reason, string detail) =>
+    '{"ticker":"' + traderspost_symbol
+      + '","action":"none","signalId":"NO_TRADE","slot":"' + slot
+      + '","reason":"' + reason
+      + '","detail":"' + detail
+      + '","or_range":' + str.tostring(nz(or_range), format.mintick)
+      + ',"break_dir":' + str.tostring(break_dir)
+      + ',"body_pct":' + str.tostring(body_pct, "#.##")
+      + ',"t":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm", tz_input) + '"}'
+
+build_summary_json() =>
+    '{"ticker":"' + traderspost_symbol
+      + '","action":"none","signalId":"DAILY_SUMMARY"'
+      + ',"entries":' + str.tostring(day_entry_cnt)
+      + ',"retouches":' + str.tostring(retouch_cnt)
+      + ',"or_range":' + str.tostring(nz(or_range), format.mintick)
+      + ',"break_dir":' + str.tostring(break_dir)
+      + ',"body_pct":' + str.tostring(body_pct, "#.##")
+      + ',"t":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm", tz_input) + '"}'
+
+// =============================================================================
+// SECTION 9 — ENTRY LOGIC (E0, E1)
+// =============================================================================
+
+// --- E0 ---
+if bar_index == break_idx and enable_e0
+    if not filter_ok
+        block_reason := filter_fail_reason
+    else
+        block_reason := na
+
+    if enable_traderspost_alerts and enable_notrade_log and not na(block_reason)
+        alert(build_notrade_json("E0", "FILTER", block_reason), alert.freq_once_per_bar)
+
+if enable_e0 and bar_index == break_idx and filter_ok
+    e0_qty  := qty_per_entry
+    e0_stop := initial_stop()
+    e0_tp   := initial_tp()
+    strategy.entry("E0", break_dir == 1 ? strategy.long : strategy.short, qty = qty_per_entry)
+    day_entry_cnt += 1
+    if show_entry_labels
+        label.new(bar_index, break_dir == 1 ? low - 8 : high + 8, "E0",
+            color = color.blue, textcolor = color.white,
+            style = break_dir == 1 ? label.style_label_up : label.style_label_down,
+            size = size.normal)
+    if enable_traderspost_alerts
+        alert(build_entry_json(break_dir == 1 ? "buy" : "sell", "E0_ENTRY", qty_per_entry), alert.freq_once_per_bar)
+
+if enable_e0 and bar_index == break_idx and not filter_ok and show_debug_labels
+    label.new(bar_index + 3, break_dir == 1 ? high + 15 : low - 15, "NO TRADE: " + filter_fail_reason,
+        color = color.orange, textcolor = color.white,
+        style = break_dir == 1 ? label.style_label_down : label.style_label_up,
+        size = size.small)
+
+// --- Retouch detection (fires E1) ---
+in_rz = break_dir == 1 ? (low  <= or_high + retouch_touch_zone) : (high >= or_low - retouch_touch_zone)
+cn_rz = break_dir == 1 ? (close > or_high + 3)                  : (close < or_low  - 3)
+
+if break_dir != 0 and bar_index > break_idx and in_rz and cn_rz and bar_index > last_r_b + 1
+    retouch_cnt += 1
+    last_r_b    := bar_index
+
+    rt_blocked = not filter_ok or not enable_e1
+    if enable_traderspost_alerts and enable_notrade_log and rt_blocked and retouch_cnt == 1
+        rt_reason = not enable_e1 ? "SLOT_DISABLED" : "FILTER"
+        alert(build_notrade_json("E1", rt_reason, filter_fail_reason), alert.freq_once_per_bar)
+
+    if retouch_cnt == 1 and enable_e1 and filter_ok
+        e1_qty  := qty_per_entry
+        e1_stop := initial_stop()
+        e1_tp   := initial_tp()
+        strategy.entry("E1", break_dir == 1 ? strategy.long : strategy.short, qty = qty_per_entry)
+        day_entry_cnt += 1
+        if show_entry_labels
+            label.new(bar_index, break_dir == 1 ? low - 18 : high + 18, "E1",
+                color = color.green, textcolor = color.white,
+                style = break_dir == 1 ? label.style_label_up : label.style_label_down,
+                size = size.normal)
+        if enable_traderspost_alerts
+            alert(build_entry_json(break_dir == 1 ? "buy" : "sell", "E1_ENTRY", qty_per_entry), alert.freq_once_per_bar)
+
+// =============================================================================
+// SECTION 10 — MFE TRACKING + BE RATCHET
+// =============================================================================
+
+if break_dir != 0 and not na(or_range)
+    curr_exc    = break_dir == 1 ? high - or_high : or_low - low
+    max_fav_exc := math.max(max_fav_exc, curr_exc)
+
+// Single ratchet: when MFE >= be_trigger × OR, move stop to break level.
+ratchet_stop(float s) =>
+    float out = s
+    if not na(or_range) and max_fav_exc >= be_trigger * or_range
+        out := break_dir == 1 ? math.max(s, or_high) : math.min(s, or_low)
+    out
+
+if e0_qty > 0
+    e0_stop := ratchet_stop(e0_stop)
+if e1_qty > 0
+    e1_stop := ratchet_stop(e1_stop)
+
+// =============================================================================
+// SECTION 11 — PER-ENTRY EXIT DETECTION & ALERTS
+// =============================================================================
+
+// --- E0 ---
+if e0_qty > 0
+    long_dir = break_dir == 1
+    stop_hit_0 = long_dir ? low  <= e0_stop : high >= e0_stop
+    tp_hit_0   = long_dir ? high >= e0_tp   : low  <= e0_tp
+
+    if stop_hit_0
+        strategy.close("E0", qty = e0_qty, comment = "E0_STOP")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E0_STOP", e0_qty), alert.freq_once_per_bar)
+        e0_qty  := 0
+        e0_stop := na
+        e0_tp   := na
+    else if tp_hit_0
+        strategy.close("E0", qty = e0_qty, comment = "E0_TP")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E0_TP", e0_qty), alert.freq_once_per_bar)
+        e0_qty  := 0
+        e0_stop := na
+        e0_tp   := na
+
+// --- E1 ---
+if e1_qty > 0
+    long_dir = break_dir == 1
+    stop_hit_1 = long_dir ? low  <= e1_stop : high >= e1_stop
+    tp_hit_1   = long_dir ? high >= e1_tp   : low  <= e1_tp
+
+    if stop_hit_1
+        strategy.close("E1", qty = e1_qty, comment = "E1_STOP")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E1_STOP", e1_qty), alert.freq_once_per_bar)
+        e1_qty  := 0
+        e1_stop := na
+        e1_tp   := na
+    else if tp_hit_1
+        strategy.close("E1", qty = e1_qty, comment = "E1_TP")
+        if enable_traderspost_alerts
+            alert(build_perentry_exit_json("E1_TP", e1_qty), alert.freq_once_per_bar)
+        e1_qty  := 0
+        e1_stop := na
+        e1_tp   := na
+
+// =============================================================================
+// SECTION 12 — FORCED FLATTEN (single guard, max one alert/bar)
+// =============================================================================
+
+total_active = e0_qty + e1_qty
+
+// --- Opposite OR level ---
+if total_active > 0 and not exit_triggered_this_bar and enable_opposite_exit
+    opposite_hit = break_dir == 1 ? low <= or_low + opposite_exit_zone : high >= or_high - opposite_exit_zone
+    if opposite_hit
+        strategy.close_all(comment = "OPPOSITE_LEVEL")
+        if enable_traderspost_alerts
+            alert(build_flatten_json("OPPOSITE_LEVEL"), alert.freq_once_per_bar)
+        exit_triggered_this_bar := true
+
+// --- Session End ---
+if t_val >= tr_e_v and not exit_triggered_this_bar and not session_end_fired
+    if total_active > 0
+        strategy.close_all(comment = "SESSION_END")
+    if enable_traderspost_alerts
+        alert(build_flatten_json("SESSION_END"), alert.freq_once_per_bar)
+    if enable_traderspost_alerts and enable_notrade_log
+        alert(build_summary_json(), alert.freq_once_per_bar)
+    exit_triggered_this_bar := true
+    session_end_fired       := true
+
+if exit_triggered_this_bar
+    e0_qty  := 0
+    e0_stop := na
+    e0_tp   := na
+    e1_qty  := 0
+    e1_stop := na
+    e1_tp   := na
+
+// =============================================================================
+// SECTION 13 — VISUALIZATION
+// =============================================================================
+
+plot(not na(or_high) and or_classified ? or_high : na, "OR High",     color.new(color.green, 0),  2, plot.style_linebr)
+plot(not na(or_low)  and or_classified ? or_low  : na, "OR Low",      color.new(color.red,   0),  2, plot.style_linebr)
+plot(not na(or_mid)  and show_midpoint  ? or_mid  : na, "OR Midpoint", color.new(color.gray, 50),  1, plot.style_linebr)
+
+// =============================================================================
+// SECTION 14 — INFO TABLE
+// =============================================================================
+
+tbl_set(t, r, k, v, vc) =>
+    table.cell(t, 0, r, k, text_color = color.new(color.gray, 20), text_size = size.small)
+    table.cell(t, 1, r, v, text_color = vc,                        text_size = size.small)
+
+if barstate.islastconfirmedhistory
+    var table tbl = na
+    if na(tbl)
+        tbl := table.new(position.top_right, 2, 7,
+            bgcolor      = color.new(color.black, 50),
+            border_width = 1,
+            border_color = color.white)
+
+    tbl_set(tbl, 0, "OR Range",    str.tostring(or_range, "#.#") + "pts", color.white)
+    tbl_set(tbl, 1, "Body %",      str.tostring(body_pct * 100, "#.#") + "%",
+                                   body_size_ok ? color.green : color.red)
+    tbl_set(tbl, 2, "Body Align",  body_aligned_ok ? "YES" : "no",
+                                   body_aligned_ok ? color.green : color.red)
+    tbl_set(tbl, 3, "Break Dir",   break_dir == 1 ? "LONG" : break_dir == -1 ? "SHORT" : "—",
+                                   break_dir != 0 ? color.white : color.gray)
+    tbl_set(tbl, 4, "Max Exc",     str.tostring(max_fav_exc, "#.#") + "pts (" +
+                                   str.tostring(not na(or_range) and or_range > 0 ? math.round(max_fav_exc / or_range * 100) : 0) + "%OR)", color.white)
+    tbl_set(tbl, 5, "Retouches",   str.tostring(retouch_cnt), color.white)
+    tbl_set(tbl, 6, "Entries",     str.tostring(day_entry_cnt) + "/2", color.white)
+
+// =============================================================================
+// SECTION 15 — ALERT TEST MODE
+// =============================================================================
+
+if barstate.islast and alert_test_mode and enable_traderspost_alerts
+    alert(build_entry_json("buy",  "E0_ENTRY", 1), alert.freq_all)
+    alert(build_entry_json("sell", "E1_ENTRY", 1), alert.freq_all)
+    alert(build_perentry_exit_json("E0_STOP", 1), alert.freq_all)
+    alert(build_perentry_exit_json("E0_TP",   1), alert.freq_all)
+    alert(build_flatten_json("OPPOSITE_LEVEL"), alert.freq_all)
+    alert(build_flatten_json("SESSION_END"),    alert.freq_all)
+    alert(build_notrade_json("E0", "FILTER", "BODY_NOT_ALIGNED"), alert.freq_all)
+    alert(build_summary_json(), alert.freq_all)
