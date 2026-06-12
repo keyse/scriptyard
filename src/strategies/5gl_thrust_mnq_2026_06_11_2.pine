@@ -1,0 +1,1485 @@
+//@version=6
+// ============================================================================
+// 5GL Thrust Pullback Strategy — MNQ — 1-min   (Model A: Pine drives, TP executes)
+// File: 5gl_thrust_mnq_2026_06_11.pine
+// ----------------------------------------------------------------------------
+// Instrument : MNQ (Micro E-mini Nasdaq-100)      TradersPost ticker: MNQ
+// Chart TF   : 1-minute  (REQUIRED — 1GL is EMA(9) on the chart TF)
+// Session    : RTH 09:30-16:00 ET (flatten 15:59, no new entries after 15:30)
+// Architecture: Model A — manual close-based detection -> strategy.entry/close
+//               + atomic alert() webhooks. No strategy.exit(); broker holds no bracket.
+// ----------------------------------------------------------------------------
+// LINES:  1GL = EMA(9) chart (1m)  |  5GL = EMA(9) @5m  |  5RL = SMA(21) @5m
+//
+// THRUST CATALOGUE MODEL (v3.0):
+//   Thrusts are catalogued (T1, T2, T3…) per day, REGARDLESS of gate state.
+//   Tradability is a SEPARATE downstream test applied AT the tap moment.
+//   Multiple T# can be tradable in parallel (each independent lifecycle).
+//   ONE TRADE PER T#. ONE POSITION AT A TIME.
+//
+// THRUST DEFINITION (short; long mirrors):
+//   Anchor   : running high recorded while close >= 1GL (continuous tracking).
+//   Arm      : close crosses BELOW 1GL — locks anchor as TH, starts state machine.
+//   End      : i_minStallBars consecutive bars without a new low (progress-based).
+//   Min len  : >= i_minThrustBars bars from arm to end (default 5).
+//   Quality  : (i_qualityMode) two options:
+//              "Efficiency" (default) = net move T / total path traveled (sum of
+//                bar high-low ranges). Measures directional efficiency — rewards
+//                strong moves regardless of bar-to-bar stutter. Min i_minEfficiency
+//                (default 0.3). A clean staircase that keeps making progress scores
+//                high even with internal bounces.
+//              "Lowering-close %" = legacy: >= i_minQualityPct % of bars must close
+//                below the prior bar. Penalizes gentle grinds (a 60-pt staircase
+//                with small bounces can score ~49% and get rejected).
+//   TH       : running high above 1GL at arm moment.
+//   TL       : lowest low across the run.
+//   T        : TH - TL (pts).
+//   Disarm   : reclaim above 1GL before stall condition triggers -> abort, no T#.
+//
+// TRADABILITY GATE (checked at THE TAP MOMENT, not earlier):
+//   Sign     : 5GL < 5RL (short) / 5GL > 5RL (long).
+//   Spread   : |5GL - 5RL| >= i_minSpreadAtrMult * ATR(14, 5m).  Default 0.5×.
+//   Slope    : (i_entrySlopeFilter) optional trend-slope gate to reject flat-line
+//              sideways. Off / 5GL (looser, fast line) / 5RL (stricter, slow line) /
+//              Both. Default 5GL. Spread alone passes when both lines are separated
+//              but flat (chop); the slope test requires the line(s) to actually be
+//              moving in the trade direction.
+//   Fail     : T# non-tradable. No second chance — moves to ✕sideways or ✕trend-against.
+//
+// ENTRY (short; long mirrors):
+//   Pullback : a bar taps the 5GL band (high >= 5GL - 0.75*ATR(14,5m)). The tap
+//              candle's body bottom = min(open, close).
+//   Confirm  : a later bar closes below that body bottom. Fresh higher taps re-arm
+//              the body reference. Tradability re-checked at each tap.
+//   Filters  : close < 5RL (location), OR pattern (opt-in vetoes), session/cap,
+//              flat-only, time window 09:50–15:30 ET.
+//
+// LADDER (P = favorable progress from entry, in pts):
+//   Init     : stop = close above 5RL.
+//   BE       : P >= 0.5*T  -> stop = E.
+//   Trail 1  : P >= 1.0*T  -> stop = E - 0.5*T (short) / E + 0.5*T (long).
+//   Trail 2  : P >= 1.5*T  -> stop = (default) 1GL with 2-close confirm, OR 5GL
+//              with 1-close confirm (toggle: i_r2TrailLine).
+//   Override : gate-flip exit (close >= 5RL for shorts, etc.) — kept ON by default.
+//   Forced   : SESSION_END at 15:59 ET.
+//
+// SCALE-IN (v3.5):
+//   Trigger     : a NEW T# tap-confirmation while already in position (re-taps of
+//                 a T# already entered/added do NOT trigger another add).
+//   Precondition: the 5GL must be sloping in the trade's direction at the pullback
+//                 (gl5m > gl5m[1] for longs, gl5m < gl5m[1] for shorts). This is
+//                 the "trend still moving" test — it keeps adds to fast directional
+//                 moves and rejects sideways chop. (Replaced the earlier BE-stop
+//                 precondition, which structurally blocked the very pullbacks we
+//                 want to add into: a real trend pullback usually arrives before
+//                 the original leg has banked 0.5*T, so BE rarely armed in time.)
+//   Direction   : same as current position only.
+//   Sizing      : i_qty per add (same as original).
+//   Cap         : 5 total legs (pyramiding=5).
+//   Modes (toggle i_addManagement):
+//     "Shared"           - all legs ride E0's stop ladder. Stop hit -> close_all
+//                          (full flatten, webhook: exit no qty). Default.
+//     "Independent"      - each leg has its own E, T, stopMode, extreme, curStop.
+//                          Stop hit on leg N -> close that leg's qty only
+//                          (webhook: exit qty=1 signalId=E{N}_STOP_*).
+//     "Independent+flip" - same as Independent, BUT gate-flip and SESSION_END
+//                          flatten everything at once.
+//
+// ============================================================================
+strategy("5GL Thrust Pullback v3.5 - MNQ 1m",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.62,
+     slippage                = 1,
+     pyramiding              = 5,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     max_lines_count         = 500,
+     max_labels_count        = 500,
+     max_boxes_count         = 500)
+
+// ─── INPUTS: DIRECTION ───────────────────────────────────────────────────────
+i_tradeLongs  = input.bool(true,  "Trade longs",  group = "Direction")
+i_tradeShorts = input.bool(true,  "Trade shorts", group = "Direction")
+
+// ─── INPUTS: LINES ───────────────────────────────────────────────────────────
+i_glFastLen = input.int(9,  "1GL length (EMA, chart TF)", minval = 1, group = "Lines")
+i_glHtfLen  = input.int(9,  "5GL length (EMA, HTF)",      minval = 1, group = "Lines")
+i_rlHtfLen  = input.int(21, "5RL length (SMA, HTF)",      minval = 1, group = "Lines")
+i_htfTf     = input.timeframe("5", "HTF for 5GL/5RL",                 group = "Lines")
+
+// ─── INPUTS: THRUST (run-quality definition) ─────────────────────────────────
+i_minThrustBars  = input.int(5,    "Min bars in thrust run",            minval = 2, group = "Thrust")
+i_minStallBars   = input.int(15,   "Bars without new low/high to end run", minval = 2, group = "Thrust")
+i_qualityMode    = input.string("Efficiency", "Quality metric",
+                                options = ["Efficiency", "Lowering-close %"], group = "Thrust")
+i_minQualityPct  = input.float(50, "Min quality % (lowering-close mode)", minval = 0, maxval = 100, step = 1, group = "Thrust")
+i_minEfficiency  = input.float(0.25, "Min efficiency (efficiency mode: net/path)", minval = 0, maxval = 1, step = 0.01, group = "Thrust")
+i_minThrustPts   = input.float(75, "Min T size (pts)",                  minval = 0, step = 0.25, group = "Thrust")
+
+// ─── INPUTS: TRADABILITY GATE (checked at tap) ──────────────────────────────
+i_atrLen          = input.int(14,   "ATR length (HTF, for spread/band)", minval = 1, group = "Gate / Pullback")
+i_minSpreadAtrMult= input.float(0.5,"Min |5GL-5RL| / ATR for gate",      minval = 0, step = 0.05, group = "Gate / Pullback")
+i_tapBandAtrMult  = input.float(0.75,"5GL tap band (×ATR)",              minval = 0, step = 0.05, group = "Gate / Pullback")
+i_entrySlopeFilter= input.string("5GL (looser)", "Entry slope filter",
+                                 options = ["Off", "5GL (looser)", "5RL (stricter)", "Both (strictest)"],
+                                 group = "Gate / Pullback")
+
+// ─── INPUTS: LADDER ──────────────────────────────────────────────────────────
+i_beTrigger  = input.float(0.5, "BE trigger (xT)",       minval = 0.0, step = 0.1, group = "Ladder")
+i_t1Trigger  = input.float(1.0, "Trail 1 trigger (xT)",  minval = 0.1, step = 0.1, group = "Ladder")
+i_t1Lock     = input.float(0.5, "Trail 1 lock (xT profit)", minval = 0.0, step = 0.1, group = "Ladder")
+i_t2Trigger  = input.float(1.5, "Trail 2 trigger (xT)",  minval = 0.1, step = 0.1, group = "Ladder")
+i_r2TrailLine= input.string("1GL (2 closes)", "Trail 2 line",
+                            options = ["1GL (2 closes)", "5GL (1 close)"], group = "Ladder")
+i_useGateFlipExit = input.bool(true, "Gate-flip exit override", group = "Ladder")
+
+// ─── INPUTS: SCALE-IN (v3.5) ─────────────────────────────────────────────────
+i_enableAdds      = input.bool(true, "Enable scale-in adds", group = "Scale-In")
+i_addManagement   = input.string("Shared", "Add management mode",
+                                 options = ["Shared", "Independent", "Independent+flip"],
+                                 group = "Scale-In")
+i_maxLegs         = input.int(5, "Max total legs (incl. original)", minval = 1, maxval = 5, group = "Scale-In")
+
+// ─── INPUTS: OR PATTERN FILTER (09:30/35/40/45 → classified 09:50) ──────────
+i_blockShortOnStrongUp   = input.bool(false, "Block shorts on STRONG_UP day",   group = "OR Pattern")
+i_blockShortOnVShape     = input.bool(false, "Block shorts on V_SHAPE day",     group = "OR Pattern")
+i_blockShortOnWeakUp     = input.bool(false, "Block shorts on WEAK_UP day",     group = "OR Pattern")
+i_blockLongOnStrongDown  = input.bool(false, "Block longs on STRONG_DOWN day",  group = "OR Pattern")
+i_blockLongOnInvV        = input.bool(false, "Block longs on INV_V day",        group = "OR Pattern")
+i_blockLongOnWeakDown    = input.bool(false, "Block longs on WEAK_DOWN day",    group = "OR Pattern")
+
+// ─── INPUTS: SESSION / CAPS ──────────────────────────────────────────────────
+i_session     = input.session("0930-1600", "RTH session (ET)", group = "Session")
+i_tz          = input.string("America/New_York", "Timezone",   group = "Session")
+i_openSkipMin = input.int(20, "Skip first N min after open",       minval = 0, group = "Session")
+i_lastEntryH  = input.int(15, "Last-entry hour (ET)",   minval = 0, maxval = 23, group = "Session")
+i_lastEntryM  = input.int(30, "Last-entry minute (ET)", minval = 0, maxval = 59, group = "Session")
+i_flatH       = input.int(15, "Flatten hour (ET)",      minval = 0, maxval = 23, group = "Session")
+i_flatM       = input.int(59, "Flatten minute (ET)",    minval = 0, maxval = 59, group = "Session")
+i_maxPerDir   = input.int(5,  "Max trades per direction/day", minval = 1, group = "Session")
+
+// ─── INPUTS: TRADERSPOST ─────────────────────────────────────────────────────
+i_tpTicker = input.string("MNQ", "TradersPost ticker", group = "TradersPost")
+i_qty      = input.int(1, "Quantity (contracts)", minval = 1, group = "TradersPost")
+
+// ─── INPUTS: TEST / VISUALS ──────────────────────────────────────────────────
+i_testMode   = input.bool(false, "TEST MODE: fire all 7 sample webhooks (KEEP OFF LIVE)", group = "Test")
+i_showThrust = input.bool(true,  "Draw thrust boxes",     group = "Visuals")
+i_showStops  = input.bool(true,  "Plot active stop",      group = "Visuals")
+i_showDash   = input.bool(true,  "Show dashboard",        group = "Visuals")
+i_showDiag   = input.bool(false, "DEBUG: show arm/disarm/end markers (diagnostic)", group = "Visuals")
+i_labelTier  = input.string("Key", "Label tier",
+                            options = ["Key", "Full", "Off"], group = "Visuals")
+
+// ─── TRADERSPOST JSON HELPERS (single-line strings; v6 builder gotcha) ───────
+f_entryJson(_action) =>
+    '{"ticker":"' + i_tpTicker + '","action":"' + _action + '","quantity":' + str.tostring(i_qty) + ',"signalId":"E0_ENTRY"}'
+f_addJson(_action, _legIdx) =>
+    '{"ticker":"' + i_tpTicker + '","action":"' + _action + '","quantity":' + str.tostring(i_qty) + ',"signalId":"E' + str.tostring(_legIdx) + '_ENTRY"}'
+f_exitJson(_sigId) =>
+    '{"ticker":"' + i_tpTicker + '","action":"exit","quantity":' + str.tostring(i_qty) + ',"signalId":"' + _sigId + '"}'
+f_flattenJson() =>
+    '{"ticker":"' + i_tpTicker + '","action":"exit","signalId":"SESSION_END"}'
+
+// ─── LINES (HTF non-repaint idiom: [1] + lookahead_on, tupled) ───────────────
+gl1m = ta.ema(close, i_glFastLen)
+[gl5m, rl5m, atr5m] = request.security(syminfo.tickerid, i_htfTf,
+     [ta.ema(close, i_glHtfLen)[1], ta.sma(close, i_rlHtfLen)[1], ta.atr(i_atrLen)[1]],
+     lookahead = barmerge.lookahead_on)
+
+plot(gl1m, "1GL", color = color.new(color.yellow, 55), linewidth = 1)
+plot(gl5m, "5GL", color = color.yellow,                linewidth = 2)
+plot(rl5m, "5RL", color = color.red,                   linewidth = 2)
+
+linesReady = not na(gl5m) and not na(rl5m) and not na(atr5m)
+
+// Gate sign (regime direction) — separate from tradability spread check
+bearGateSign = linesReady and gl5m < rl5m
+bullGateSign = linesReady and gl5m > rl5m
+gateSpread   = linesReady ? math.abs(gl5m - rl5m) : na
+gateSpreadOk = linesReady and gateSpread >= i_minSpreadAtrMult * atr5m
+
+// Entry slope filter (kills flat-line sideways entries). Toggle: Off / 5GL / 5RL / Both.
+gl5mDown = gl5m < gl5m[1]
+gl5mUp   = gl5m > gl5m[1]
+rl5mDown = rl5m < rl5m[1]
+rl5mUp   = rl5m > rl5m[1]
+bearSlopeOk = i_entrySlopeFilter == "Off" ? true :
+     i_entrySlopeFilter == "5GL (looser)"   ? gl5mDown :
+     i_entrySlopeFilter == "5RL (stricter)" ? rl5mDown :
+     gl5mDown and rl5mDown   // Both
+bullSlopeOk = i_entrySlopeFilter == "Off" ? true :
+     i_entrySlopeFilter == "5GL (looser)"   ? gl5mUp :
+     i_entrySlopeFilter == "5RL (stricter)" ? rl5mUp :
+     gl5mUp and rl5mUp
+
+bearTradable = bearGateSign and gateSpreadOk
+bullTradable = bullGateSign and gateSpreadOk
+
+// Lane offset for labels (keeps roles in separate vertical bands)
+laneOff = na(atr5m) ? 1.0 : atr5m * 0.5
+
+// ─── SESSION / TIME ──────────────────────────────────────────────────────────
+inSession = not na(time(timeframe.period, i_session, i_tz))
+hNow      = hour(time, i_tz)
+mNow      = minute(time, i_tz)
+isNewDay  = ta.change(dayofmonth(time, i_tz)) != 0
+
+var int sessStart = na
+if inSession and not inSession[1]
+    sessStart := time
+inOpenSkip = inSession and not na(sessStart) and (time - sessStart) < i_openSkipMin * 60 * 1000
+
+afterLastEntry = (hNow > i_lastEntryH) or (hNow == i_lastEntryH and mNow >= i_lastEntryM)
+atFlat         = (hNow > i_flatH)      or (hNow == i_flatH      and mNow >= i_flatM)
+canEnter       = inSession and not inOpenSkip and not afterLastEntry and not atFlat
+
+var int longCnt  = 0
+var int shortCnt = 0
+if isNewDay
+    longCnt  := 0
+    shortCnt := 0
+
+// ─── OR PATTERN CLASSIFIER (09:30/35/40/45 → lock at 09:50) ─────────────────
+var float orC1 = na
+var float orC2 = na
+var float orC3 = na
+var float orC4 = na
+var string orPat = "UNKNOWN"
+var bool   orLocked = false
+
+if isNewDay
+    orC1 := na
+    orC2 := na
+    orC3 := na
+    orC4 := na
+    orPat := "UNKNOWN"
+    orLocked := false
+
+or5mClose = request.security(syminfo.tickerid, "5", close[1], lookahead = barmerge.lookahead_on)
+if inSession and hNow == 9
+    if mNow == 35 and na(orC1)
+        orC1 := or5mClose
+    if mNow == 40 and na(orC2)
+        orC2 := or5mClose
+    if mNow == 45 and na(orC3)
+        orC3 := or5mClose
+    if mNow == 50 and na(orC4) and not orLocked
+        orC4 := or5mClose
+        if not na(orC1) and not na(orC2) and not na(orC3) and not na(orC4)
+            up12 = orC2 > orC1
+            up23 = orC3 > orC2
+            up34 = orC4 > orC3
+            dn12 = orC2 < orC1
+            dn23 = orC3 < orC2
+            dn34 = orC4 < orC3
+            allUp   = up12 and up23 and up34
+            allDown = dn12 and dn23 and dn34
+            netUp   = orC4 > orC1
+            netDown = orC4 < orC1
+            if allUp
+                orPat := "STRONG_UP"
+            else if allDown
+                orPat := "STRONG_DOWN"
+            else if up12 and up23 and dn34
+                orPat := "INV_V"
+            else if dn12 and dn23 and up34
+                orPat := "V_SHAPE"
+            else if netUp
+                orPat := "WEAK_UP"
+            else if netDown
+                orPat := "WEAK_DOWN"
+            else
+                orPat := "UNKNOWN"
+            orLocked := true
+
+orPatPending = not orLocked and inSession
+
+f_orBlocksShort() =>
+    (i_blockShortOnStrongUp and orPat == "STRONG_UP") or
+       (i_blockShortOnVShape and orPat == "V_SHAPE")  or
+       (i_blockShortOnWeakUp and orPat == "WEAK_UP")
+f_orBlocksLong() =>
+    (i_blockLongOnStrongDown and orPat == "STRONG_DOWN") or
+       (i_blockLongOnInvV   and orPat == "INV_V")        or
+       (i_blockLongOnWeakDown and orPat == "WEAK_DOWN")
+
+// ─── THRUST CATALOGUE STATE (parallel T#) ────────────────────────────────────
+var int    bearThrustCount = 0
+var int    bullThrustCount = 0
+if isNewDay
+    bearThrustCount := 0
+    bullThrustCount := 0
+
+var array<int>   bThrustNum    = array.new<int>()
+var array<float> bThrustTH     = array.new<float>()
+var array<float> bThrustTL     = array.new<float>()
+var array<float> bThrustT      = array.new<float>()
+var array<int>   bThrustStart  = array.new<int>()
+var array<int>   bThrustEndBar = array.new<int>()
+var array<float> bTouchBody    = array.new<float>()
+var array<bool>  bTradabilityChecked = array.new<bool>()
+var array<bool>  bTradable     = array.new<bool>()
+var array<string> bRejectReason = array.new<string>()
+
+var array<int>   lThrustNum    = array.new<int>()
+var array<float> lThrustTH     = array.new<float>()
+var array<float> lThrustTL     = array.new<float>()
+var array<float> lThrustT      = array.new<float>()
+var array<int>   lThrustStart  = array.new<int>()
+var array<int>   lThrustEndBar = array.new<int>()
+var array<float> lTouchBody    = array.new<float>()
+var array<bool>  lTradabilityChecked = array.new<bool>()
+var array<bool>  lTradable     = array.new<bool>()
+var array<string> lRejectReason = array.new<string>()
+
+if isNewDay
+    array.clear(bThrustNum)
+    array.clear(bThrustTH)
+    array.clear(bThrustTL)
+    array.clear(bThrustT)
+    array.clear(bThrustStart)
+    array.clear(bThrustEndBar)
+    array.clear(bTouchBody)
+    array.clear(bTradabilityChecked)
+    array.clear(bTradable)
+    array.clear(bRejectReason)
+    array.clear(lThrustNum)
+    array.clear(lThrustTH)
+    array.clear(lThrustTL)
+    array.clear(lThrustT)
+    array.clear(lThrustStart)
+    array.clear(lThrustEndBar)
+    array.clear(lTouchBody)
+    array.clear(lTradabilityChecked)
+    array.clear(lTradable)
+    array.clear(lRejectReason)
+
+// ─── THRUST DETECTION ────────────────────────────────────────────────────────
+var float runHighAbove1GL = na
+var float runLowBelow1GL  = na
+var bool  wasAbove1GL     = false
+var bool  wasBelow1GL     = false
+
+if close > gl1m
+    if not wasAbove1GL
+        runHighAbove1GL := high
+    else
+        runHighAbove1GL := math.max(nz(runHighAbove1GL, high), high)
+    wasAbove1GL := true
+    wasBelow1GL := false
+else if close < gl1m
+    if not wasBelow1GL
+        runLowBelow1GL := low
+    else
+        runLowBelow1GL := math.min(nz(runLowBelow1GL, low), low)
+    wasBelow1GL := true
+    wasAbove1GL := false
+
+crossBelow1GL = ta.crossunder(close, gl1m)
+crossAbove1GL = ta.crossover(close,  gl1m)
+
+// BEAR thrust running state
+var bool   bRunActive   = false
+var float  bRunTH       = na
+var int    bRunStartBar = na
+var float  bRunLow      = na
+var int    bRunLowBar   = na
+var int    bRunBars     = 0
+var int    bRunLowering = 0
+var int    bRunStall    = 0
+var float  bRunPath     = 0.0   // sum of bar ranges (high-low) for efficiency
+
+bool bJustArmed = false
+if crossBelow1GL and i_tradeShorts and not bRunActive
+    bRunActive   := true
+    bJustArmed   := true
+    bRunTH       := math.max(nz(runHighAbove1GL[1], high), high)
+    bRunStartBar := bar_index - 1
+    bRunLow      := low
+    bRunLowBar   := bar_index
+    bRunBars     := 0
+    bRunLowering := 0
+    bRunStall    := 0
+    bRunPath     := 0.0
+    if i_showDiag
+        label.new(bar_index, high,
+            text = "bArm TH=" + str.tostring(bRunTH, "#.#"),
+            style = label.style_label_down,
+            color = color.new(color.red, 50),
+            textcolor = color.white, size = size.tiny)
+
+bool   bValid = false
+int    bStartB = na
+int    bEndB   = na
+float  bTH     = na
+float  bTL     = na
+float  bT      = na
+
+if bRunActive and not bJustArmed
+    bRunBars := bRunBars + 1
+    bRunPath := bRunPath + (high - low)   // accumulate total path traveled
+    bool madeNewLow = low < bRunLow
+    if madeNewLow
+        bRunLow    := low
+        bRunLowBar := bar_index
+        bRunStall  := 0
+    else
+        bRunStall := bRunStall + 1
+    if close < close[1]
+        bRunLowering := bRunLowering + 1
+    if bRunStall >= i_minStallBars
+        float qPctDbg = bRunBars > 0 ? bRunLowering / bRunBars * 100 : 0
+        float tDbg    = bRunTH - bRunLow
+        float effDbg  = bRunPath > 0 ? tDbg / bRunPath : 0
+        bool  qualityOk = i_qualityMode == "Efficiency" ? effDbg >= i_minEfficiency : qPctDbg >= i_minQualityPct
+        if bRunBars >= i_minThrustBars
+            if qualityOk
+                if tDbg >= i_minThrustPts
+                    bValid  := true
+                    bStartB := bRunStartBar
+                    bEndB   := bRunLowBar
+                    bTH     := bRunTH
+                    bTL     := bRunLow
+                    bT      := tDbg
+        if i_showDiag
+            string qFailTxt = i_qualityMode == "Efficiency" ? "✕eff=" + str.tostring(effDbg, "#.##") : "✕q=" + str.tostring(qPctDbg, "#.#") + "%"
+            string verdict = bValid ? "OK" :
+                 bRunBars < i_minThrustBars ? "✕bars=" + str.tostring(bRunBars) :
+                 not qualityOk ? qFailTxt :
+                 "✕T=" + str.tostring(tDbg, "#.#")
+            label.new(bar_index, low,
+                text = "bEnd " + verdict,
+                style = label.style_label_up,
+                color = bValid ? color.new(color.lime, 30) : color.new(color.gray, 40),
+                textcolor = color.white, size = size.tiny)
+        bRunActive := false
+
+if bRunActive and close > bRunTH
+    bRunActive := false
+
+// BULL thrust running state
+var bool   lRunActive   = false
+var float  lRunTL       = na
+var int    lRunStartBar = na
+var float  lRunHigh     = na
+var int    lRunHighBar  = na
+var int    lRunBars     = 0
+var int    lRunRaising  = 0
+var int    lRunStall    = 0
+var float  lRunPath     = 0.0
+
+bool lJustArmed = false
+if crossAbove1GL and i_tradeLongs and not lRunActive
+    lRunActive   := true
+    lJustArmed   := true
+    lRunTL       := math.min(nz(runLowBelow1GL[1], low), low)
+    lRunStartBar := bar_index - 1
+    lRunHigh     := high
+    lRunHighBar  := bar_index
+    lRunBars     := 0
+    lRunRaising  := 0
+    lRunStall    := 0
+    lRunPath     := 0.0
+    if i_showDiag
+        label.new(bar_index, low,
+            text = "lArm TL=" + str.tostring(lRunTL, "#.#"),
+            style = label.style_label_up,
+            color = color.new(color.green, 50),
+            textcolor = color.white, size = size.tiny)
+
+bool   lValid = false
+int    lStartB = na
+int    lEndB   = na
+float  lTH     = na
+float  lTL     = na
+float  lT      = na
+
+if lRunActive and not lJustArmed
+    lRunBars := lRunBars + 1
+    lRunPath := lRunPath + (high - low)
+    bool madeNewHigh = high > lRunHigh
+    if madeNewHigh
+        lRunHigh    := high
+        lRunHighBar := bar_index
+        lRunStall   := 0
+    else
+        lRunStall := lRunStall + 1
+    if close > close[1]
+        lRunRaising := lRunRaising + 1
+    if lRunStall >= i_minStallBars
+        float qPctDbgL = lRunBars > 0 ? lRunRaising / lRunBars * 100 : 0
+        float tDbgL    = lRunHigh - lRunTL
+        float effDbgL  = lRunPath > 0 ? tDbgL / lRunPath : 0
+        bool  qualityOkL = i_qualityMode == "Efficiency" ? effDbgL >= i_minEfficiency : qPctDbgL >= i_minQualityPct
+        if lRunBars >= i_minThrustBars
+            if qualityOkL
+                if tDbgL >= i_minThrustPts
+                    lValid  := true
+                    lStartB := lRunStartBar
+                    lEndB   := lRunHighBar
+                    lTH     := lRunHigh
+                    lTL     := lRunTL
+                    lT      := tDbgL
+        if i_showDiag
+            string qFailTxtL = i_qualityMode == "Efficiency" ? "✕eff=" + str.tostring(effDbgL, "#.##") : "✕q=" + str.tostring(qPctDbgL, "#.#") + "%"
+            string verdictL = lValid ? "OK" :
+                 lRunBars < i_minThrustBars ? "✕bars=" + str.tostring(lRunBars) :
+                 not qualityOkL ? qFailTxtL :
+                 "✕T=" + str.tostring(tDbgL, "#.#")
+            label.new(bar_index, high,
+                text = "lEnd " + verdictL,
+                style = label.style_label_down,
+                color = lValid ? color.new(color.lime, 30) : color.new(color.gray, 40),
+                textcolor = color.white, size = size.tiny)
+        lRunActive := false
+
+if lRunActive and close < lRunTL
+    lRunActive := false
+
+if bValid and i_tradeShorts and array.size(bThrustNum) < 5
+    bearThrustCount := bearThrustCount + 1
+    array.push(bThrustNum,   bearThrustCount)
+    array.push(bThrustTH,    bTH)
+    array.push(bThrustTL,    bTL)
+    array.push(bThrustT,     bT)
+    array.push(bThrustStart, bStartB)
+    array.push(bThrustEndBar,bEndB)
+    array.push(bTouchBody,   na)
+    array.push(bTradabilityChecked, false)
+    array.push(bTradable,    false)
+    array.push(bRejectReason, "")
+    if i_showThrust
+        box.new(bStartB, bTH, bEndB, bTL,
+            border_color = color.new(color.red, 0),
+            bgcolor      = color.new(color.red, 92))
+    if i_labelTier != "Off"
+        int durMin = (bEndB - bStartB)
+        label.new(bEndB, bTH + laneOff,
+            text  = "T" + str.tostring(bearThrustCount) + "=" + str.tostring(bT, "#.#") + " " + str.tostring(durMin) + "m",
+            style = label.style_label_down,
+            color = color.new(color.red, 30),
+            textcolor = color.white,
+            size  = size.tiny)
+
+if lValid and i_tradeLongs and array.size(lThrustNum) < 5
+    bullThrustCount := bullThrustCount + 1
+    array.push(lThrustNum,   bullThrustCount)
+    array.push(lThrustTH,    lTH)
+    array.push(lThrustTL,    lTL)
+    array.push(lThrustT,     lT)
+    array.push(lThrustStart, lStartB)
+    array.push(lThrustEndBar,lEndB)
+    array.push(lTouchBody,   na)
+    array.push(lTradabilityChecked, false)
+    array.push(lTradable,    false)
+    array.push(lRejectReason, "")
+    if i_showThrust
+        box.new(lStartB, lTH, lEndB, lTL,
+            border_color = color.new(color.green, 0),
+            bgcolor      = color.new(color.green, 92))
+    if i_labelTier != "Off"
+        int durMin = (lEndB - lStartB)
+        label.new(lEndB, lTL - laneOff,
+            text  = "T" + str.tostring(bullThrustCount) + "=" + str.tostring(lT, "#.#") + " " + str.tostring(durMin) + "m",
+            style = label.style_label_up,
+            color = color.new(color.green, 30),
+            textcolor = color.white,
+            size  = size.tiny)
+
+// ─── POSITION STATE (v3.5: scalar = leg 0, arrays for per-leg in Indep modes) ─
+var int   posSide  = 0
+var float E        = na      // leg-0 entry (or shared E in Shared mode)
+var float T_act    = na      // leg-0 T
+var float TH_act   = na
+var float TL_act   = na
+var int   stopMode = 0       // leg-0 stop mode (or shared in Shared mode)
+var float extreme  = na      // leg-0 extreme (or shared)
+var float curStop  = na      // leg-0 current stop (or shared)
+var int   r2CloseCount = 0
+var int   activeTnum   = na  // leg-0 T#
+
+// Per-leg arrays (used in Independent modes; in Shared mode only leg-0 matters
+// but we still push to these so labels/dashboard can show leg count).
+var array<float>  legE         = array.new<float>()
+var array<float>  legT         = array.new<float>()
+var array<float>  legTH        = array.new<float>()
+var array<float>  legTL        = array.new<float>()
+var array<int>    legStopMode  = array.new<int>()
+var array<float>  legExtreme   = array.new<float>()
+var array<float>  legCurStop   = array.new<float>()
+var array<int>    legR2CC      = array.new<int>()  // r2 close counter per leg
+var array<int>    legTnum      = array.new<int>()
+var array<string> legEntryId   = array.new<string>()  // "Long_L0", "Short_L1", etc.
+
+// T#s already entered (original or as adds) — prevents re-tap of same T# from
+// firing another add. Cleared on full flatten.
+var array<int> activeTnums = array.new<int>()
+
+// ─── PROCESS BEAR THRUSTS ────────────────────────────────────────────────────
+var int wrSideways    = 0
+var int wrTrendAgainst= 0
+var int wrBelow5RL    = 0
+var int wrInPos       = 0
+var int wrTime        = 0
+var int wrCap         = 0
+var int wrPattern     = 0
+var int wrPatPending  = 0
+if isNewDay
+    wrSideways     := 0
+    wrTrendAgainst := 0
+    wrBelow5RL     := 0
+    wrInPos        := 0
+    wrTime         := 0
+    wrCap          := 0
+    wrPattern      := 0
+    wrPatPending   := 0
+
+bearTapBand = na(atr5m) ? na : gl5m - i_tapBandAtrMult * atr5m
+bullTapBand = na(atr5m) ? na : gl5m + i_tapBandAtrMult * atr5m
+
+var int bearEntryT = na
+var int bullEntryT = na
+bool bearEntrySig = false
+bool bullEntrySig = false
+bool bearAddSig   = false  // v3.5: this entry is an ADD (in-position) not original
+bool bullAddSig   = false
+float bearAddT_   = na     // T of the thrust being added on
+float bullAddT_   = na
+float bearAddTH_  = na
+float bullAddTH_  = na
+float bearAddTL_  = na
+float bullAddTL_  = na
+
+if array.size(bThrustNum) > 0
+    for i = array.size(bThrustNum) - 1 to 0
+        float th_ = array.get(bThrustTH, i)
+        float tl_ = array.get(bThrustTL, i)
+        float t_  = array.get(bThrustT,  i)
+        int   num = array.get(bThrustNum, i)
+        float body = array.get(bTouchBody, i)
+        bool  checked = array.get(bTradabilityChecked, i)
+        bool  tradable = array.get(bTradable, i)
+        string rsn = array.get(bRejectReason, i)
+
+        if high > th_
+            array.remove(bThrustNum, i)
+            array.remove(bThrustTH, i)
+            array.remove(bThrustTL, i)
+            array.remove(bThrustT, i)
+            array.remove(bThrustStart, i)
+            array.remove(bThrustEndBar, i)
+            array.remove(bTouchBody, i)
+            array.remove(bTradabilityChecked, i)
+            array.remove(bTradable, i)
+            array.remove(bRejectReason, i)
+            continue
+
+        bool freshTap = not na(bearTapBand) and high >= bearTapBand and (na(body) or close > body)
+        if freshTap
+            array.set(bTouchBody, i, math.min(open, close))
+            // Re-evaluate tradability on EVERY fresh tap (not just the first).
+            // Regime/spread are time-varying: a thrust that was ✕trend at an early
+            // tap (regime still bull) becomes tradable once 5GL crosses below 5RL.
+            // A down-thrust + sideways pullback that later confirms bear is exactly
+            // the weak-bounce continuation short we want to catch.
+            if not bearGateSign
+                array.set(bTradable, i, false)
+                array.set(bRejectReason, i, "✕trend")
+                wrTrendAgainst := wrTrendAgainst + 1
+            else if not gateSpreadOk
+                array.set(bTradable, i, false)
+                array.set(bRejectReason, i, "✕sideways")
+                wrSideways := wrSideways + 1
+            else
+                array.set(bTradable, i, true)
+                array.set(bRejectReason, i, "")
+            // Paint tap/reject label only when verdict is NEW or CHANGED. `checked`
+            // is still false here on the very first tap of this thrust.
+            bool firstCheck = not checked
+            array.set(bTradabilityChecked, i, true)
+            if i_labelTier != "Off"
+                bool tp = array.get(bTradable, i)
+                string newRsn = array.get(bRejectReason, i)
+                bool verdictChanged = firstCheck or (newRsn != rsn)
+                if verdictChanged and (tp or i_labelTier == "Full")
+                    label.new(bar_index, high + laneOff * 0.5,
+                        text = tp ? "tap ✓" : newRsn,
+                        style = label.style_label_down,
+                        color = tp ? color.new(color.orange, 40) : color.new(color.gray, 30),
+                        textcolor = color.white,
+                        size  = size.tiny)
+            checked  := array.get(bTradabilityChecked, i)
+            tradable := array.get(bTradable, i)
+            body     := array.get(bTouchBody, i)
+
+        if tradable and not na(body) and close < body
+            bool inWindow = canEnter
+            bool locOk    = close < rl5m
+            bool capOk    = shortCnt < i_maxPerDir
+            bool flatOk   = posSide == 0
+            bool patOk    = not f_orBlocksShort() and not orPatPending
+
+            // v3.5 ADD path: if already SHORT, check if this tap qualifies as an add
+            bool isAddCandidate = false
+            bool alreadyEnteredThisT = false
+            bool gl5mFalling  = gl5m < gl5m[1]      // 5GL sloping down = trend still moving (short)
+            bool underCap     = array.size(legE) < i_maxLegs
+            bool addsEnabled  = i_enableAdds
+            bool wrongDir     = posSide == 1   // long while we're evaluating a short tap
+            if posSide == -1 and addsEnabled
+                for ti = 0 to array.size(activeTnums) - 1
+                    if array.get(activeTnums, ti) == num
+                        alreadyEnteredThisT := true
+                        break
+                bool canAdd = not alreadyEnteredThisT and gl5mFalling and underCap
+                if canAdd
+                    isAddCandidate := true
+
+            // Wait-reason counting (add path doesn't count as wrInPos since it's legal)
+            if posSide != 0 and not isAddCandidate
+                wrInPos := wrInPos + 1
+            else if not inWindow
+                wrTime := wrTime + 1
+            else if not capOk
+                wrCap := wrCap + 1
+            else if not locOk
+                wrBelow5RL := wrBelow5RL + 1
+            else if orPatPending
+                wrPatPending := wrPatPending + 1
+            else if not patOk
+                wrPattern := wrPattern + 1
+
+            // Determine the outcome reason for the diagnostic label
+            string outcomeTxt = ""
+            bool outcomeIsAccept = false
+            // Original entry path (flat) — now requires slope filter to pass
+            if inWindow and locOk and capOk and flatOk and patOk and bearSlopeOk
+                bearEntrySig := true
+                bearEntryT   := num
+                E        := close
+                T_act    := t_
+                TH_act   := th_
+                TL_act   := tl_
+                activeTnum := num
+                outcomeTxt := "entry L0 T" + str.tostring(num) + "=" + str.tostring(t_, "#.#")
+                outcomeIsAccept := true
+                array.remove(bThrustNum, i)
+                array.remove(bThrustTH, i)
+                array.remove(bThrustTL, i)
+                array.remove(bThrustT, i)
+                array.remove(bThrustStart, i)
+                array.remove(bThrustEndBar, i)
+                array.remove(bTouchBody, i)
+                array.remove(bTradabilityChecked, i)
+                array.remove(bTradable, i)
+                array.remove(bRejectReason, i)
+            // ADD path
+            else if inWindow and locOk and capOk and isAddCandidate and patOk
+                bearAddSig  := true
+                bearEntryT  := num
+                bearAddT_   := t_
+                bearAddTH_  := th_
+                bearAddTL_  := tl_
+                int newLegIdx = array.size(legE)
+                outcomeTxt := "+L" + str.tostring(newLegIdx) + " T" + str.tostring(num) + "=" + str.tostring(t_, "#.#")
+                outcomeIsAccept := true
+                array.remove(bThrustNum, i)
+                array.remove(bThrustTH, i)
+                array.remove(bThrustTL, i)
+                array.remove(bThrustT, i)
+                array.remove(bThrustStart, i)
+                array.remove(bThrustEndBar, i)
+                array.remove(bTouchBody, i)
+                array.remove(bTradabilityChecked, i)
+                array.remove(bTradable, i)
+                array.remove(bRejectReason, i)
+            // Rejection — pick the most informative reason in priority order
+            else
+                outcomeTxt := wrongDir ? "✕wrong-dir" :
+                     not inWindow ? "✕time" :
+                     not capOk ? "✕cap-day" :
+                     not locOk ? "✕5RL" :
+                     orPatPending ? "✕pat?" :
+                     not patOk ? "✕pat" :
+                     posSide == 0 and not bearSlopeOk ? "✕slope-flat" :
+                     posSide == -1 and not addsEnabled ? "✕adds off" :
+                     posSide == -1 and alreadyEnteredThisT ? "✕same T#" :
+                     posSide == -1 and not gl5mFalling ? "✕5GL flat" :
+                     posSide == -1 and not underCap ? "✕cap" :
+                     "✕unknown"
+                array.set(bTouchBody, i, na)
+
+            // Paint diagnostic label — but only once per DISTINCT reason per thrust.
+            // On accept, arrays for this thrust were already removed, so skip the
+            // array read and always paint the accept label.
+            bool reasonChanged = true
+            if not outcomeIsAccept
+                string lastReason = array.get(bRejectReason, i)
+                reasonChanged := outcomeTxt != lastReason
+                array.set(bRejectReason, i, outcomeTxt)
+            if i_labelTier != "Off" and outcomeTxt != "✕time" and outcomeTxt != "✕wrong-dir" and (outcomeIsAccept or reasonChanged)
+                label.new(bar_index, high + laneOff,
+                    text = outcomeTxt,
+                    style = label.style_label_down,
+                    color = outcomeIsAccept ? color.new(color.red, 0) : color.new(color.gray, 25),
+                    textcolor = color.white,
+                    size = size.tiny)
+
+            if outcomeIsAccept
+                break
+
+if not bearEntrySig and array.size(lThrustNum) > 0
+    for i = array.size(lThrustNum) - 1 to 0
+        float th_ = array.get(lThrustTH, i)
+        float tl_ = array.get(lThrustTL, i)
+        float t_  = array.get(lThrustT,  i)
+        int   num = array.get(lThrustNum, i)
+        float body = array.get(lTouchBody, i)
+        bool  checked = array.get(lTradabilityChecked, i)
+        bool  tradable = array.get(lTradable, i)
+        string rsn = array.get(lRejectReason, i)
+
+        if low < tl_
+            array.remove(lThrustNum, i)
+            array.remove(lThrustTH, i)
+            array.remove(lThrustTL, i)
+            array.remove(lThrustT, i)
+            array.remove(lThrustStart, i)
+            array.remove(lThrustEndBar, i)
+            array.remove(lTouchBody, i)
+            array.remove(lTradabilityChecked, i)
+            array.remove(lTradable, i)
+            array.remove(lRejectReason, i)
+            continue
+
+        bool freshTap = not na(bullTapBand) and low <= bullTapBand and (na(body) or close < body)
+        if freshTap
+            array.set(lTouchBody, i, math.max(open, close))
+            // Re-evaluate tradability on EVERY fresh tap (mirror of bear fix).
+            if not bullGateSign
+                array.set(lTradable, i, false)
+                array.set(lRejectReason, i, "✕trend")
+                wrTrendAgainst := wrTrendAgainst + 1
+            else if not gateSpreadOk
+                array.set(lTradable, i, false)
+                array.set(lRejectReason, i, "✕sideways")
+                wrSideways := wrSideways + 1
+            else
+                array.set(lTradable, i, true)
+                array.set(lRejectReason, i, "")
+            bool firstCheck = not checked
+            array.set(lTradabilityChecked, i, true)
+            if i_labelTier != "Off"
+                bool tp = array.get(lTradable, i)
+                string newRsn = array.get(lRejectReason, i)
+                bool verdictChanged = firstCheck or (newRsn != rsn)
+                if verdictChanged and (tp or i_labelTier == "Full")
+                    label.new(bar_index, low - laneOff * 0.5,
+                        text = tp ? "tap ✓" : newRsn,
+                        style = label.style_label_up,
+                        color = tp ? color.new(color.orange, 40) : color.new(color.gray, 30),
+                        textcolor = color.white,
+                        size  = size.tiny)
+            checked  := array.get(lTradabilityChecked, i)
+            tradable := array.get(lTradable, i)
+            body     := array.get(lTouchBody, i)
+
+        if tradable and not na(body) and close > body
+            bool inWindow = canEnter
+            bool locOk    = close > rl5m
+            bool capOk    = longCnt < i_maxPerDir
+            bool flatOk   = posSide == 0
+            bool patOk    = not f_orBlocksLong() and not orPatPending
+
+            // v3.5 ADD path (mirror)
+            bool isAddCandidate = false
+            bool alreadyEnteredThisT = false
+            bool gl5mRising   = gl5m > gl5m[1]      // 5GL sloping up = trend still moving (long)
+            bool underCap     = array.size(legE) < i_maxLegs
+            bool addsEnabled  = i_enableAdds
+            bool wrongDir     = posSide == -1
+            if posSide == 1 and addsEnabled
+                for ti = 0 to array.size(activeTnums) - 1
+                    if array.get(activeTnums, ti) == num
+                        alreadyEnteredThisT := true
+                        break
+                bool canAdd = not alreadyEnteredThisT and gl5mRising and underCap
+                if canAdd
+                    isAddCandidate := true
+
+            if posSide != 0 and not isAddCandidate
+                wrInPos := wrInPos + 1
+            else if not inWindow
+                wrTime := wrTime + 1
+            else if not capOk
+                wrCap := wrCap + 1
+            else if not locOk
+                wrBelow5RL := wrBelow5RL + 1
+            else if orPatPending
+                wrPatPending := wrPatPending + 1
+            else if not patOk
+                wrPattern := wrPattern + 1
+
+            string outcomeTxt = ""
+            bool outcomeIsAccept = false
+            if inWindow and locOk and capOk and flatOk and patOk and bullSlopeOk
+                bullEntrySig := true
+                bullEntryT   := num
+                E        := close
+                T_act    := t_
+                TH_act   := th_
+                TL_act   := tl_
+                activeTnum := num
+                outcomeTxt := "entry L0 T" + str.tostring(num) + "=" + str.tostring(t_, "#.#")
+                outcomeIsAccept := true
+                array.remove(lThrustNum, i)
+                array.remove(lThrustTH, i)
+                array.remove(lThrustTL, i)
+                array.remove(lThrustT, i)
+                array.remove(lThrustStart, i)
+                array.remove(lThrustEndBar, i)
+                array.remove(lTouchBody, i)
+                array.remove(lTradabilityChecked, i)
+                array.remove(lTradable, i)
+                array.remove(lRejectReason, i)
+            else if inWindow and locOk and capOk and isAddCandidate and patOk
+                bullAddSig  := true
+                bullEntryT  := num
+                bullAddT_   := t_
+                bullAddTH_  := th_
+                bullAddTL_  := tl_
+                int newLegIdx = array.size(legE)
+                outcomeTxt := "+L" + str.tostring(newLegIdx) + " T" + str.tostring(num) + "=" + str.tostring(t_, "#.#")
+                outcomeIsAccept := true
+                array.remove(lThrustNum, i)
+                array.remove(lThrustTH, i)
+                array.remove(lThrustTL, i)
+                array.remove(lThrustT, i)
+                array.remove(lThrustStart, i)
+                array.remove(lThrustEndBar, i)
+                array.remove(lTouchBody, i)
+                array.remove(lTradabilityChecked, i)
+                array.remove(lTradable, i)
+                array.remove(lRejectReason, i)
+            else
+                outcomeTxt := wrongDir ? "✕wrong-dir" :
+                     not inWindow ? "✕time" :
+                     not capOk ? "✕cap-day" :
+                     not locOk ? "✕5RL" :
+                     orPatPending ? "✕pat?" :
+                     not patOk ? "✕pat" :
+                     posSide == 0 and not bullSlopeOk ? "✕slope-flat" :
+                     posSide == 1 and not addsEnabled ? "✕adds off" :
+                     posSide == 1 and alreadyEnteredThisT ? "✕same T#" :
+                     posSide == 1 and not gl5mRising ? "✕5GL flat" :
+                     posSide == 1 and not underCap ? "✕cap" :
+                     "✕unknown"
+                array.set(lTouchBody, i, na)
+
+            bool reasonChangedL = true
+            if not outcomeIsAccept
+                string lastReasonL = array.get(lRejectReason, i)
+                reasonChangedL := outcomeTxt != lastReasonL
+                array.set(lRejectReason, i, outcomeTxt)
+            if i_labelTier != "Off" and outcomeTxt != "✕time" and outcomeTxt != "✕wrong-dir" and (outcomeIsAccept or reasonChangedL)
+                label.new(bar_index, low - laneOff,
+                    text = outcomeTxt,
+                    style = label.style_label_up,
+                    color = outcomeIsAccept ? color.new(color.lime, 0) : color.new(color.gray, 25),
+                    textcolor = color.white,
+                    size = size.tiny)
+
+            if outcomeIsAccept
+                break
+
+if bearEntrySig
+    strategy.entry("Short_L0", strategy.short, qty = i_qty)
+    alert(f_entryJson("sell"), alert.freq_once_per_bar)
+    posSide  := -1
+    stopMode := 0
+    extreme  := low
+    curStop  := rl5m
+    shortCnt := shortCnt + 1
+    r2CloseCount := 0
+    // Push leg 0 state
+    array.push(legE,        E)
+    array.push(legT,        T_act)
+    array.push(legTH,       TH_act)
+    array.push(legTL,       TL_act)
+    array.push(legStopMode, 0)
+    array.push(legExtreme,  low)
+    array.push(legCurStop,  rl5m)
+    array.push(legR2CC,     0)
+    array.push(legTnum,     bearEntryT)
+    array.push(legEntryId,  "Short_L0")
+    array.push(activeTnums, bearEntryT)
+    if i_labelTier != "Off"
+        label.new(bar_index, low - laneOff,
+            text  = "▼S L0 T" + str.tostring(bearEntryT) + "=" + str.tostring(T_act, "#.#"),
+            style = label.style_label_up,
+            color = color.new(color.red, 0),
+            textcolor = color.white,
+            size  = size.small)
+
+if bullEntrySig
+    strategy.entry("Long_L0", strategy.long, qty = i_qty)
+    alert(f_entryJson("buy"), alert.freq_once_per_bar)
+    posSide  := 1
+    stopMode := 0
+    extreme  := high
+    curStop  := rl5m
+    longCnt  := longCnt + 1
+    r2CloseCount := 0
+    array.push(legE,        E)
+    array.push(legT,        T_act)
+    array.push(legTH,       TH_act)
+    array.push(legTL,       TL_act)
+    array.push(legStopMode, 0)
+    array.push(legExtreme,  high)
+    array.push(legCurStop,  rl5m)
+    array.push(legR2CC,     0)
+    array.push(legTnum,     bullEntryT)
+    array.push(legEntryId,  "Long_L0")
+    array.push(activeTnums, bullEntryT)
+    if i_labelTier != "Off"
+        label.new(bar_index, high + laneOff,
+            text  = "▲L L0 T" + str.tostring(bullEntryT) + "=" + str.tostring(T_act, "#.#"),
+            style = label.style_label_down,
+            color = color.new(color.lime, 0),
+            textcolor = color.white,
+            size  = size.small)
+
+// v3.5 ADD firing — already in position, new T# tapped, E0 at BE+
+if bearAddSig
+    int legIdx = array.size(legE)        // this new leg's index (0-based)
+    string entryId = "Short_L" + str.tostring(legIdx)
+    strategy.entry(entryId, strategy.short, qty = i_qty)
+    alert(f_addJson("sell", legIdx), alert.freq_once_per_bar)
+    shortCnt := shortCnt + 1
+    array.push(legE,        close)
+    array.push(legT,        bearAddT_)
+    array.push(legTH,       bearAddTH_)
+    array.push(legTL,       bearAddTL_)
+    array.push(legStopMode, 0)
+    array.push(legExtreme,  low)
+    array.push(legCurStop,  rl5m)
+    array.push(legR2CC,     0)
+    array.push(legTnum,     bearEntryT)
+    array.push(legEntryId,  entryId)
+    array.push(activeTnums, bearEntryT)
+    if i_labelTier != "Off"
+        label.new(bar_index, low - laneOff,
+            text  = "▼+ L" + str.tostring(legIdx) + " T" + str.tostring(bearEntryT) + "=" + str.tostring(bearAddT_, "#.#"),
+            style = label.style_label_up,
+            color = color.new(color.maroon, 10),
+            textcolor = color.white,
+            size  = size.small)
+
+if bullAddSig
+    int legIdx = array.size(legE)
+    string entryId = "Long_L" + str.tostring(legIdx)
+    strategy.entry(entryId, strategy.long, qty = i_qty)
+    alert(f_addJson("buy", legIdx), alert.freq_once_per_bar)
+    longCnt := longCnt + 1
+    array.push(legE,        close)
+    array.push(legT,        bullAddT_)
+    array.push(legTH,       bullAddTH_)
+    array.push(legTL,       bullAddTL_)
+    array.push(legStopMode, 0)
+    array.push(legExtreme,  high)
+    array.push(legCurStop,  rl5m)
+    array.push(legR2CC,     0)
+    array.push(legTnum,     bullEntryT)
+    array.push(legEntryId,  entryId)
+    array.push(activeTnums, bullEntryT)
+    if i_labelTier != "Off"
+        label.new(bar_index, high + laneOff,
+            text  = "▲+ L" + str.tostring(legIdx) + " T" + str.tostring(bullEntryT) + "=" + str.tostring(bullAddT_, "#.#"),
+            style = label.style_label_down,
+            color = color.new(color.green, 10),
+            textcolor = color.white,
+            size  = size.small)
+
+enteredThisBar = bearEntrySig or bullEntrySig or bearAddSig or bullAddSig
+
+if posSide != 0 and not enteredThisBar
+    bool isShort = posSide == -1
+    bool sharedMode = i_addManagement == "Shared"
+    bool flipFloor  = i_addManagement == "Independent+flip"
+
+    // ─── SHARED MODE: original scalar ladder drives one stop for all legs ────
+    if sharedMode
+        extreme := isShort ? math.min(extreme, low) : math.max(extreme, high)
+
+        float P = isShort ? (E - extreme) : (extreme - E)
+        if stopMode < 1 and P >= i_beTrigger  * T_act
+            stopMode := 1
+            // Keep leg-0 array in sync so the add-eligibility check works
+            if array.size(legStopMode) > 0
+                array.set(legStopMode, 0, 1)
+            if i_labelTier == "Full"
+                label.new(bar_index, isShort ? high + laneOff : low - laneOff,
+                    text = "BE", style = isShort ? label.style_label_down : label.style_label_up,
+                    color = color.new(color.aqua, 20), textcolor = color.black, size = size.tiny)
+        if stopMode < 2 and P >= i_t1Trigger * T_act
+            stopMode := 2
+            if array.size(legStopMode) > 0
+                array.set(legStopMode, 0, 2)
+            if i_labelTier == "Full"
+                label.new(bar_index, isShort ? high + laneOff : low - laneOff,
+                    text = "T1", style = isShort ? label.style_label_down : label.style_label_up,
+                    color = color.new(color.aqua, 20), textcolor = color.black, size = size.tiny)
+        if stopMode < 3 and P >= i_t2Trigger * T_act
+            stopMode := 3
+            r2CloseCount := 0
+            if array.size(legStopMode) > 0
+                array.set(legStopMode, 0, 3)
+            if i_labelTier == "Full"
+                label.new(bar_index, isShort ? high + laneOff : low - laneOff,
+                    text = "T2", style = isShort ? label.style_label_down : label.style_label_up,
+                    color = color.new(color.aqua, 20), textcolor = color.black, size = size.tiny)
+
+        string exitId = na
+        bool   hit    = false
+        if stopMode == 0
+            curStop := rl5m
+            hit     := isShort ? close > rl5m : close < rl5m
+            exitId  := "E0_STOP_RL"
+        else if stopMode == 1
+            curStop := E
+            hit     := isShort ? close > E : close < E
+            exitId  := "E0_STOP_BE"
+        else if stopMode == 2
+            curStop := isShort ? E - i_t1Lock * T_act : E + i_t1Lock * T_act
+            hit     := isShort ? close > curStop : close < curStop
+            exitId  := "E0_STOP_TRAIL1"
+        else
+            if i_r2TrailLine == "5GL (1 close)"
+                curStop := gl5m
+                hit     := isShort ? close > gl5m : close < gl5m
+                exitId  := "E0_STOP_TRAIL2"
+            else
+                curStop := gl1m
+                bool barAgainst = isShort ? close > gl1m : close < gl1m
+                r2CloseCount := barAgainst ? r2CloseCount + 1 : 0
+                hit := r2CloseCount >= 2
+                exitId := "E0_STOP_TRAIL2"
+
+        if i_useGateFlipExit and not hit and stopMode < 3
+            bool flipped = (isShort and bullGateSign) or (not isShort and bearGateSign)
+            if flipped
+                hit    := true
+                exitId := "E0_GATE_FLIP"
+
+        if hit
+            // Close ALL legs (Shared mode: one stop for the whole stack)
+            strategy.close_all(comment = exitId)
+            alert(f_exitJson(exitId), alert.freq_once_per_bar)
+            if i_labelTier != "Off"
+                string shortTxt = exitId == "E0_STOP_RL" ? "✕RL" :
+                     exitId == "E0_STOP_BE" ? "BE" :
+                     exitId == "E0_STOP_TRAIL1" ? "T1" :
+                     exitId == "E0_STOP_TRAIL2" ? "T2" :
+                     exitId == "E0_GATE_FLIP" ? "✕flip" : exitId
+                if i_labelTier == "Full" or exitId == "E0_STOP_RL" or exitId == "E0_GATE_FLIP"
+                    label.new(bar_index, isShort ? high + laneOff * 1.5 : low - laneOff * 1.5,
+                        text = shortTxt,
+                        style = isShort ? label.style_label_down : label.style_label_up,
+                        color = color.new(color.fuchsia, 20), textcolor = color.white, size = size.tiny)
+            posSide  := 0
+            E        := na
+            T_act    := na
+            TH_act   := na
+            TL_act   := na
+            stopMode := 0
+            extreme  := na
+            curStop  := na
+            r2CloseCount := 0
+            activeTnum   := na
+            array.clear(legE)
+            array.clear(legT)
+            array.clear(legTH)
+            array.clear(legTL)
+            array.clear(legStopMode)
+            array.clear(legExtreme)
+            array.clear(legCurStop)
+            array.clear(legR2CC)
+            array.clear(legTnum)
+            array.clear(legEntryId)
+            array.clear(activeTnums)
+
+    // ─── INDEPENDENT MODE (and +flip): each leg has its own ladder ───────────
+    else
+        // First: check gate-flip / disaster floor for "Independent+flip" mode
+        bool flipped = (isShort and bullGateSign) or (not isShort and bearGateSign)
+        bool floorTrip = flipFloor and i_useGateFlipExit and flipped
+        if floorTrip
+            strategy.close_all(comment = "E0_GATE_FLIP")
+            alert(f_exitJson("E0_GATE_FLIP"), alert.freq_once_per_bar)
+            if i_labelTier != "Off"
+                label.new(bar_index, isShort ? high + laneOff * 1.5 : low - laneOff * 1.5,
+                    text = "✕flip(all)",
+                    style = isShort ? label.style_label_down : label.style_label_up,
+                    color = color.new(color.fuchsia, 20), textcolor = color.white, size = size.tiny)
+            posSide  := 0
+            E        := na
+            T_act    := na
+            stopMode := 0
+            extreme  := na
+            curStop  := na
+            r2CloseCount := 0
+            activeTnum   := na
+            array.clear(legE)
+            array.clear(legT)
+            array.clear(legTH)
+            array.clear(legTL)
+            array.clear(legStopMode)
+            array.clear(legExtreme)
+            array.clear(legCurStop)
+            array.clear(legR2CC)
+            array.clear(legTnum)
+            array.clear(legEntryId)
+            array.clear(activeTnums)
+        else
+            // Iterate legs in reverse so removals are safe
+            for li = array.size(legE) - 1 to 0
+                float lE     = array.get(legE, li)
+                float lT_    = array.get(legT, li)
+                int   lSM    = array.get(legStopMode, li)
+                float lExt   = array.get(legExtreme, li)
+                int   lR2    = array.get(legR2CC, li)
+                int   lTn    = array.get(legTnum, li)
+                string lEid  = array.get(legEntryId, li)
+
+                // Advance extreme
+                lExt := isShort ? math.min(lExt, low) : math.max(lExt, high)
+                array.set(legExtreme, li, lExt)
+
+                float P = isShort ? (lE - lExt) : (lExt - lE)
+
+                if lSM < 1 and P >= i_beTrigger * lT_
+                    lSM := 1
+                if lSM < 2 and P >= i_t1Trigger * lT_
+                    lSM := 2
+                if lSM < 3 and P >= i_t2Trigger * lT_
+                    lSM := 3
+                    lR2 := 0
+                array.set(legStopMode, li, lSM)
+
+                string exitId = na
+                bool   hit    = false
+                float  lStop  = na
+                if lSM == 0
+                    lStop  := rl5m
+                    hit    := isShort ? close > rl5m : close < rl5m
+                    exitId := "E" + str.tostring(li) + "_STOP_RL"
+                else if lSM == 1
+                    lStop  := lE
+                    hit    := isShort ? close > lE : close < lE
+                    exitId := "E" + str.tostring(li) + "_STOP_BE"
+                else if lSM == 2
+                    lStop  := isShort ? lE - i_t1Lock * lT_ : lE + i_t1Lock * lT_
+                    hit    := isShort ? close > lStop : close < lStop
+                    exitId := "E" + str.tostring(li) + "_STOP_TRAIL1"
+                else
+                    if i_r2TrailLine == "5GL (1 close)"
+                        lStop  := gl5m
+                        hit    := isShort ? close > gl5m : close < gl5m
+                        exitId := "E" + str.tostring(li) + "_STOP_TRAIL2"
+                    else
+                        lStop := gl1m
+                        bool barAgainst = isShort ? close > gl1m : close < gl1m
+                        lR2 := barAgainst ? lR2 + 1 : 0
+                        array.set(legR2CC, li, lR2)
+                        hit := lR2 >= 2
+                        exitId := "E" + str.tostring(li) + "_STOP_TRAIL2"
+
+                array.set(legCurStop, li, lStop)
+
+                // Per-leg gate-flip exit (Independent without +flip floor)
+                if i_useGateFlipExit and not hit and lSM < 3 and flipped
+                    hit    := true
+                    exitId := "E" + str.tostring(li) + "_GATE_FLIP"
+
+                if hit
+                    strategy.close(lEid, comment = exitId)
+                    alert(f_exitJson(exitId), alert.freq_once_per_bar)
+                    if i_labelTier != "Off"
+                        string shortTxt = "✕L" + str.tostring(li)
+                        if i_labelTier == "Full" or str.contains(exitId, "STOP_RL") or str.contains(exitId, "GATE_FLIP")
+                            label.new(bar_index, isShort ? high + laneOff * 1.5 : low - laneOff * 1.5,
+                                text = shortTxt,
+                                style = isShort ? label.style_label_down : label.style_label_up,
+                                color = color.new(color.fuchsia, 20), textcolor = color.white, size = size.tiny)
+                    // Remove this leg from arrays
+                    array.remove(legE, li)
+                    array.remove(legT, li)
+                    array.remove(legTH, li)
+                    array.remove(legTL, li)
+                    array.remove(legStopMode, li)
+                    array.remove(legExtreme, li)
+                    array.remove(legCurStop, li)
+                    array.remove(legR2CC, li)
+                    array.remove(legTnum, li)
+                    array.remove(legEntryId, li)
+                    // Note: activeTnums NOT cleared on per-leg exit — re-tap of same
+                    // T# should still be blocked (one trade per T# rule).
+
+            // If all legs exited, reset position state
+            if array.size(legE) == 0
+                posSide  := 0
+                E        := na
+                T_act    := na
+                stopMode := 0
+                extreme  := na
+                curStop  := na
+                r2CloseCount := 0
+                activeTnum   := na
+                array.clear(activeTnums)
+            else
+                // Keep scalar mirrors in sync with leg-0 for dashboard/add-eligibility
+                E        := array.get(legE, 0)
+                T_act    := array.get(legT, 0)
+                stopMode := array.get(legStopMode, 0)
+                extreme  := array.get(legExtreme, 0)
+                curStop  := array.get(legCurStop, 0)
+                activeTnum := array.get(legTnum, 0)
+
+var bool flatFired = false
+if isNewDay
+    flatFired := false
+if atFlat and posSide != 0 and not flatFired
+    strategy.close_all(comment = "SESSION_END")
+    alert(f_flattenJson(), alert.freq_once_per_bar)
+    flatFired := true
+    posSide  := 0
+    E        := na
+    T_act    := na
+    TH_act   := na
+    TL_act   := na
+    stopMode := 0
+    extreme  := na
+    curStop  := na
+    r2CloseCount := 0
+    activeTnum   := na
+    array.clear(legE)
+    array.clear(legT)
+    array.clear(legTH)
+    array.clear(legTL)
+    array.clear(legStopMode)
+    array.clear(legExtreme)
+    array.clear(legCurStop)
+    array.clear(legR2CC)
+    array.clear(legTnum)
+    array.clear(legEntryId)
+    array.clear(activeTnums)
+
+var bool testSent = false
+if i_testMode and barstate.islast and not testSent
+    alert(f_entryJson("sell"),            alert.freq_once_per_bar)
+    alert(f_addJson("sell", 1),           alert.freq_once_per_bar)  // E1_ENTRY add sample
+    alert(f_exitJson("E0_STOP_RL"),       alert.freq_once_per_bar)
+    alert(f_exitJson("E0_STOP_BE"),       alert.freq_once_per_bar)
+    alert(f_exitJson("E0_STOP_TRAIL1"),   alert.freq_once_per_bar)
+    alert(f_exitJson("E0_STOP_TRAIL2"),   alert.freq_once_per_bar)
+    alert(f_exitJson("E0_GATE_FLIP"),     alert.freq_once_per_bar)
+    alert(f_flattenJson(),                alert.freq_once_per_bar)
+    testSent := true
+
+plot(i_showStops and posSide != 0 ? curStop : na, "Active Stop",
+     color = color.fuchsia, style = plot.style_linebr, linewidth = 2)
+
+// ─── DASHBOARD (top-right, styled: title header, zebra, color cells) ─────────
+var table dash = table.new(position.top_right, 2, 13,
+    bgcolor = color.new(color.black, 60), border_width = 1, border_color = color.new(color.gray, 50),
+    frame_width = 1, frame_color = color.new(color.gray, 30))
+
+// Zebra row backgrounds
+zebraA = color.new(#1a1a2e, 30)
+zebraB = color.new(#16213e, 30)
+hdrBg  = color.new(#0f3460, 10)
+sectBg = color.new(#533483, 35)
+
+f_modeStr() =>
+    stopMode == 0 ? "INIT (5RL)" :
+       stopMode == 1 ? "BE" :
+       stopMode == 2 ? "Trail 1 (E±0.5T)" :
+       "Trail 2 (" + (i_r2TrailLine == "5GL (1 close)" ? "5GL" : "1GL") + ")"
+
+posStr  = posSide == 0 ? "FLAT" : (posSide == 1 ? "LONG" : "SHORT") + (array.size(legE) > 1 ? " ×" + str.tostring(array.size(legE)) : "")
+
+f_gateStr() =>
+    if not linesReady
+        "—"
+    else
+        string side = bearGateSign ? "SHORT" : (bullGateSign ? "LONG" : "FLAT")
+        float  s    = math.round(gateSpread * 10) / 10
+        string ok   = gateSpreadOk ? " ✓" : " ✕sw"
+        side + " sprd=" + str.tostring(s) + ok
+
+f_htfStr() =>
+    if not linesReady
+        "—"
+    else
+        bearGateSign ? "5GL<5RL (bear)" : (bullGateSign ? "5GL>5RL (bull)" : "—")
+
+f_setupStr() =>
+    int bs = array.size(bThrustNum)
+    int ls = array.size(lThrustNum)
+    if bs == 0 and ls == 0
+        "—"
+    else
+        str.tostring(bs) + "B / " + str.tostring(ls) + "L live"
+
+closed = strategy.closedtrades
+wins   = strategy.wintrades
+wrPct  = closed > 0 ? wins / closed * 100 : na
+wrStr  = closed > 0 ? str.format("{0,number,#.#} %", wrPct) : "—"
+gl_    = math.abs(strategy.grossloss)
+pf     = gl_ > 0 ? strategy.grossprofit / gl_ : na
+pfStr  = gl_ > 0 ? str.format("{0,number,#.##}", pf) :
+         (strategy.grossprofit > 0 ? "inf" : "—")
+netVal = strategy.netprofit
+
+f_waitStr() =>
+    "sw=" + str.tostring(wrSideways) +
+       " ta=" + str.tostring(wrTrendAgainst) +
+       " loc=" + str.tostring(wrBelow5RL) +
+       " pat=" + str.tostring(wrPattern)
+
+// Cell color helpers
+gateCellColor = not linesReady ? zebraA : (bearGateSign ? color.new(color.red, 70) : (bullGateSign ? color.new(color.green, 70) : zebraA))
+netCellColor  = na(netVal) ? zebraB : (netVal >= 0 ? color.new(color.green, 65) : color.new(color.red, 65))
+wrCellColor   = na(wrPct) ? zebraA : (wrPct >= 50 ? color.new(color.green, 70) : (wrPct >= 40 ? color.new(color.orange, 70) : color.new(color.red, 75)))
+posCellColor  = posSide == 0 ? zebraB : (posSide == 1 ? color.new(color.green, 65) : color.new(color.red, 65))
+
+f_row(_r, _label, _val, _bg, _valColor) =>
+    table.cell(dash, 0, _r, _label, text_color = color.new(color.gray, 10), text_size = size.small, bgcolor = _bg, text_halign = text.align_left)
+    table.cell(dash, 1, _r, _val,   text_color = _valColor,                 text_size = size.small, bgcolor = _bg, text_halign = text.align_right)
+
+if i_showDash and barstate.islast
+    // Title header (row 0 spans visually via both cells)
+    table.cell(dash, 0, 0, "5GL THRUST", text_color = color.white, text_size = size.small, bgcolor = hdrBg, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "v3.5", text_color = color.new(color.gray, 20), text_size = size.small, bgcolor = hdrBg, text_halign = text.align_right)
+    // Section 1: regime
+    f_row(1, "HTF",        f_htfStr(),  zebraA, color.white)
+    f_row(2, "Gate",       f_gateStr(), gateCellColor, color.white)
+    f_row(3, "OR pattern", orPat + (orPatPending ? " (pend)" : ""), zebraA, color.white)
+    // Section 2: live state (divider via section color on label cell)
+    table.cell(dash, 0, 4, "Setup",    text_color = color.white, text_size = size.small, bgcolor = sectBg, text_halign = text.align_left)
+    table.cell(dash, 1, 4, f_setupStr(), text_color = color.white, text_size = size.small, bgcolor = sectBg, text_halign = text.align_right)
+    f_row(5, "Position",  posStr, posCellColor, color.white)
+    f_row(6, "Entry / T", posSide != 0 ? str.tostring(E, format.mintick) + " / " + str.tostring(T_act, "#.#") + " (T" + str.tostring(activeTnum) + ")" : "—", zebraB, color.white)
+    f_row(7, "Stop mode", posSide != 0 ? f_modeStr() : "—", zebraA, color.white)
+    // Section 3: stats
+    table.cell(dash, 0, 8, "Trades L/S", text_color = color.white, text_size = size.small, bgcolor = sectBg, text_halign = text.align_left)
+    table.cell(dash, 1, 8, str.format("{0}/{1} today", longCnt, shortCnt), text_color = color.white, text_size = size.small, bgcolor = sectBg, text_halign = text.align_right)
+    f_row(9,  "Wait", f_waitStr(), zebraA, color.new(color.gray, 10))
+    f_row(10, "Closed", str.tostring(closed), zebraB, color.white)
+    f_row(11, "Win rate", wrStr, wrCellColor, color.white)
+    f_row(12, "Net / PF", str.tostring(netVal, format.mintick) + " / " + pfStr, netCellColor, color.white)
